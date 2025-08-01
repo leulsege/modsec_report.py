@@ -142,9 +142,13 @@ def generate_stats(attacks):
             method = attack["request"].split()[0]
             stats["methods"][method] += 1
 
-        if "SQL Injection" in attack["message"]:
+        # Enhanced severity classification
+        msg_lower = attack["message"].lower()
+        if "sql injection" in msg_lower or "rce" in msg_lower or "remote code execution" in msg_lower:
+            stats["by_severity"]["Critical"] += 1
+        elif "xss" in msg_lower or "cross-site scripting" in msg_lower:
             stats["by_severity"]["High"] += 1
-        elif "XSS" in attack["message"]:
+        elif "injection" in msg_lower or "traversal" in msg_lower or "file inclusion" in msg_lower:
             stats["by_severity"]["Medium"] += 1
         else:
             stats["by_severity"]["Low"] += 1
@@ -161,6 +165,40 @@ def generate_stats(attacks):
 def build_html_report(attacks, stats):
     if not attacks:
         return f"<html><body><h1>No Security Events from {START_DATE} to {END_DATE}</h1></body></html>"
+
+    # Calculate severity counts
+    severity_counts = {
+        "Critical": stats["by_severity"].get("Critical", 0),
+        "High": stats["by_severity"].get("High", 0),
+        "Medium": stats["by_severity"].get("Medium", 0),
+        "Low": stats["by_severity"].get("Low", 0)
+    }
+
+    # Severity cards HTML
+    severity_cards = f"""
+    <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; margin: 20px 0;">
+        <div style="background: linear-gradient(135deg, #ff4d4d, #ff1a1a); padding: 15px; border-radius: 8px; color: white; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+            <div style="font-size: 12px; opacity: 0.9;">CRITICAL</div>
+            <div style="font-size: 24px; font-weight: bold;">{severity_counts['Critical']}</div>
+            <div style="font-size: 11px;">{(severity_counts['Critical']/stats['total_attacks'])*100:.1f}%</div>
+        </div>
+        <div style="background: linear-gradient(135deg, #ff9966, #ff5e62); padding: 15px; border-radius: 8px; color: white; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+            <div style="font-size: 12px; opacity: 0.9;">HIGH</div>
+            <div style="font-size: 24px; font-weight: bold;">{severity_counts['High']}</div>
+            <div style="font-size: 11px;">{(severity_counts['High']/stats['total_attacks'])*100:.1f}%</div>
+        </div>
+        <div style="background: linear-gradient(135deg, #ffcc00, #ffaa00); padding: 15px; border-radius: 8px; color: white; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+            <div style="font-size: 12px; opacity: 0.9;">MEDIUM</div>
+            <div style="font-size: 24px; font-weight: bold;">{severity_counts['Medium']}</div>
+            <div style="font-size: 11px;">{(severity_counts['Medium']/stats['total_attacks'])*100:.1f}%</div>
+        </div>
+        <div style="background: linear-gradient(135deg, #66cc66, #2eb82e); padding: 15px; border-radius: 8px; color: white; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+            <div style="font-size: 12px; opacity: 0.9;">LOW</div>
+            <div style="font-size: 24px; font-weight: bold;">{severity_counts['Low']}</div>
+            <div style="font-size: 11px;">{(severity_counts['Low']/stats['total_attacks'])*100:.1f}%</div>
+        </div>
+    </div>
+    """
 
     attack_types_chart = ""
     for msg, count in stats["top_5_attack_types"]:
@@ -225,6 +263,8 @@ def build_html_report(attacks, stats):
                 <p><strong>Total Attacks:</strong> {stats["total_attacks"]}</p>
                 <p><strong>Unique Attack Types:</strong> {len(stats["attack_types"])}</p>
                 <p><strong>Unique Attackers:</strong> {len(stats["top_attackers"])}</p>
+                
+                {severity_cards}
             </div>
 
             <div class="card">
