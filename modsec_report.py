@@ -8,7 +8,9 @@ from email.mime.text import MIMEText
 from collections import defaultdict
 import datetime
 
+# ==============================
 # Config
+# ==============================
 LOG_FILE = "/usr/local/apache/logs/modsec_audit.log"
 DOMAIN = "zpanel.site"
 SMTP_SERVER = "cloud.zergaw.com"
@@ -16,6 +18,11 @@ SMTP_PORT = 587
 SMTP_USER = "security.update@zergaw.com"
 SMTP_PASS = "YOUR_PASSWORD"
 TO_EMAIL = "recipient@example.com"
+
+# Date Range (Default: last 7 days)
+END_DATE = datetime.date.today()
+START_DATE = END_DATE - datetime.timedelta(days=7)
+# ==============================
 
 # 🌍 Get country for IP with caching
 @lru_cache(maxsize=200)
@@ -41,7 +48,7 @@ def get_ip_country(ip):
     return "Unknown"
 
 def parse_modsec_log():
-    """Parse ModSecurity log for the given domain."""
+    """Parse ModSecurity log for the given domain and date range."""
     with open(LOG_FILE, "r", errors="ignore") as f:
         content = f.read()
 
@@ -52,19 +59,37 @@ def parse_modsec_log():
         if f"Host: {DOMAIN}" not in block:
             continue
 
+        # Extract timestamp
         ts_match = re.search(
-            r"\[(\d{2}/\w+/\d{4}:\d{2}:\d{2}:\d{2})", block
+            r"\[(\d{2}/\w+/\d{4}):(\d{2}:\d{2}:\d{2})", block
         )
-        timestamp = ts_match.group(1) if ts_match else "N/A"
+        if not ts_match:
+            continue
 
+        timestamp_str = ts_match.group(1)  # Example: 01/Aug/2025
+        time_str = ts_match.group(2)       # Example: 11:43:15
+
+        try:
+            attack_datetime = datetime.datetime.strptime(
+                f"{timestamp_str}:{time_str}", "%d/%b/%Y:%H:%M:%S"
+            )
+        except ValueError:
+            continue
+
+        # Filter by date range
+        if not (START_DATE <= attack_datetime.date() <= END_DATE):
+            continue
+
+        attacker_ip = "N/A"
         ip_match = re.search(
             r"^\[.*?\]\s+[a-zA-Z0-9]+\s+([\d\.]+)\s", block, re.MULTILINE
         )
         if not ip_match:
             ip_match = re.search(r"X-Real-IP:\s*([\d\.]+)", block)
-        attacker_ip = ip_match.group(1) if ip_match else "N/A"
+        if ip_match:
+            attacker_ip = ip_match.group(1)
 
-        country = get_ip_country(attacker_ip)  # 🌍 Get country here
+        country = get_ip_country(attacker_ip)  # 🌍 Get country
 
         req_match = re.search(
             r"(GET|POST|HEAD|PUT|DELETE|OPTIONS) ([^\s]+) HTTP", block
@@ -82,7 +107,8 @@ def parse_modsec_log():
         for msg in messages:
             attacks.append(
                 {
-                    "time": timestamp,
+                    "date": attack_datetime.strftime("%d/%b/%Y"),  # ✅ date only
+                    "time": attack_datetime.strftime("%H:%M:%S"),  # ✅ time only
                     "ip": attacker_ip,
                     "country": country,
                     "request": request_line,
@@ -106,14 +132,11 @@ def generate_stats(attacks):
         stats["attack_types"][attack["message"]] += 1
         stats["top_attackers"][(attack["ip"], attack["country"])] += 1
 
-        if attack["time"] != "N/A":
-            try:
-                dt = datetime.datetime.strptime(
-                    attack["time"], "%d/%b/%Y:%H:%M:%S"
-                )
-                stats["hourly_distribution"][dt.hour] += 1
-            except:
-                pass
+        try:
+            dt = datetime.datetime.strptime(f"{attack['date']} {attack['time']}", "%d/%b/%Y %H:%M:%S")
+            stats["hourly_distribution"][dt.hour] += 1
+        except:
+            pass
 
         if attack["request"] != "N/A":
             method = attack["request"].split()[0]
@@ -127,22 +150,17 @@ def generate_stats(attacks):
             stats["by_severity"]["Low"] += 1
 
     stats["top_5_attack_types"] = sorted(
-        stats["attack_types"].items(),
-        key=lambda x: x[1],
-        reverse=True
+        stats["attack_types"].items(), key=lambda x: x[1], reverse=True
     )[:5]
-
     stats["top_5_attackers"] = sorted(
-        stats["top_attackers"].items(),
-        key=lambda x: x[1],
-        reverse=True
+        stats["top_attackers"].items(), key=lambda x: x[1], reverse=True
     )[:5]
 
     return stats
 
 def build_html_report(attacks, stats):
     if not attacks:
-        return f"<html><body><h1>No Security Events</h1></body></html>"
+        return f"<html><body><h1>No Security Events from {START_DATE} to {END_DATE}</h1></body></html>"
 
     attack_types_chart = ""
     for msg, count in stats["top_5_attack_types"]:
@@ -159,18 +177,19 @@ def build_html_report(attacks, stats):
         </div>
         """
 
-    # Top Attackers
     top_attackers_rows = "".join(
-        f"<tr><td>{ip}<br><small>[{country}]</small></td><td>{count}</td><td>{(count / stats['total_attacks']) * 100:.1f}%</td></tr>"
+        f"<tr><td>{ip}<br><small>{country}</small></td><td>{count}</td><td>{(count / stats['total_attacks']) * 100:.1f}%</td></tr>"
         for (ip, country), count in stats["top_5_attackers"]
     )
 
-    # Recent Attacks
     recent_attacks_rows = "".join(
         f"""
         <tr>
-            <td>{atk['time']}</td>
-            <td>{atk['ip']}<br><small>[{atk['country']}]</small></td>
+            <td>
+                <div>{atk['date']}</div>
+                <div style="font-size:11px; color:#777;">{atk['time']}</div>
+            </td>
+            <td>{atk['ip']}<br><small>{atk['country']}</small></td>
             <td style="word-break:break-word;">{atk['request']}</td>
             <td style="word-break:break-word;">{atk['message']}</td>
             <td><span style="background-color:#e74c3c;color:white;padding:2px 8px;border-radius:12px;">BLOCKED</span></td>
@@ -179,7 +198,6 @@ def build_html_report(attacks, stats):
         for atk in attacks[:10]
     )
 
-    # HTML
     html = f"""
     <html>
     <head>
@@ -197,6 +215,11 @@ def build_html_report(attacks, stats):
     </head>
     <body>
         <div class="container">
+            <div class="card" style="text-align:center; font-size:14px; color:#555;">
+                <strong>Security Threat Report</strong><br>
+                Report from <strong>{START_DATE}</strong> to <strong>{END_DATE}</strong>
+            </div>
+
             <div class="card">
                 <h2>Security Overview</h2>
                 <p><strong>Total Attacks:</strong> {stats["total_attacks"]}</p>
@@ -222,7 +245,7 @@ def build_html_report(attacks, stats):
                 <table>
                     <thead>
                         <tr>
-                            <th>Time</th><th>IP</th><th>Request</th><th>Message</th><th>Status</th>
+                            <th>Date / Time</th><th>IP</th><th>Request</th><th>Message</th><th>Status</th>
                         </tr>
                     </thead>
                     <tbody>{recent_attacks_rows}</tbody>
