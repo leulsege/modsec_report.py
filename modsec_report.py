@@ -328,7 +328,7 @@ def build_html_report(attacks, stats):
 
             <!-- Overview -->
             <div class="card">
-                <h2>{subtitle}</h2>
+                <h2>Security Overview</h2>
                 <p><strong>Total Attacks:</strong> {stats["total_attacks"]}</p>
                 <p><strong>Unique Attack Types:</strong> {len(stats["attack_types"])}</p>
                 <p><strong>Unique Attackers:</strong> {len(stats["top_attackers"])}</p>
