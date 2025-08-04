@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3 
 import re
 import smtplib
 import requests
@@ -12,7 +12,7 @@ import datetime
 # Config
 # ==============================
 LOG_FILE = "/usr/local/apache/logs/modsec_audit.log"
-DOMAIN = "zpanel.site"
+DOMAIN = "zpanel.site"  # replace with the actual domain, e.g., "abc.com"
 SMTP_SERVER = "cloud.zergaw.com"
 SMTP_PORT = 587
 SMTP_USER = "security.update@zergaw.com"
@@ -166,8 +166,43 @@ def generate_stats(attacks):
     return stats
 
 def build_html_report(attacks, stats):
+    title_text = f"Weekly security update for your site: {DOMAIN}"
+    subtitle = "Zergaw Cloud WAF Security Update"
+    date_range_str = f"{START_DATE} to {END_DATE}"
+
     if not attacks:
-        return f"<html><body><h1>No Security Events from {START_DATE} to {END_DATE}</h1></body></html>"
+        return f"""
+        <html>
+        <head>
+            <style>
+                body {{ font-family: Arial, sans-serif; background:#f5f5f5; }}
+                .container {{ max-width: 900px; margin: auto; padding: 20px; }}
+                .card {{ background: white; border-radius: 8px; padding: 20px; margin-bottom: 30px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); }}
+                h1 {{ margin:0; }}
+                .header {{ display: flex; align-items: center; gap: 20px; }}
+                .small {{ font-size:12px; color:#666; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="card header">
+                    <div style="flex:0 0 auto;">
+                        <img src="https://office.zergaw.com/web/image/website/1/logo/" alt="Logo" style="height:60px; object-fit:contain;">
+                    </div>
+                    <div style="flex:1;">
+                        <div style="font-size:20px; font-weight:bold;">{title_text}</div>
+                        <div style="font-size:14px; margin-top:4px;">{subtitle}</div>
+                        <div class="small" style="margin-top:6px;">Report from <strong>{START_DATE}</strong> to <strong>{END_DATE}</strong></div>
+                    </div>
+                </div>
+                <div class="card">
+                    <h2>No Security Events</h2>
+                    <p>This is a weekly security update for <strong>{DOMAIN}</strong>. There were no recorded security events from <strong>{START_DATE}</strong> to <strong>{END_DATE}</strong>.</p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
 
     # Calculate severity counts
     severity_counts = {
@@ -220,10 +255,9 @@ def build_html_report(attacks, stats):
 
     top_attackers_rows = "".join(
         f"<tr><td>{ip}<br><small>{country}</small></td><td>{count}</td><td>{(count / stats['total_attacks']) * 100:.1f}%</td></tr>"
-        for (ip, country), count in stats["top_5_attackers"]
+        for (ip, country), count in stats["top_attackers"]
     )
 
-    # Recent attacks: already sorted descending in parse, take first 10 (latest)
     recent_attacks_rows = "".join(
         f"""
         <tr>
@@ -253,17 +287,30 @@ def build_html_report(attacks, stats):
             th {{ background-color: #f4f4f4; font-size: 13px; }}
             tr:nth-child(even) {{ background-color: #fafafa; }}
             td {{ font-size: 13px; }}
+            .header {{ display: flex; align-items: center; gap: 20px; flex-wrap: wrap; }}
+            .title-block {{ flex:1; min-width:220px; }}
+            .small {{ font-size:12px; color:#666; }}
         </style>
     </head>
     <body>
         <div class="container">
-            <div class="card" style="text-align:center; font-size:14px; color:#555;">
-                <strong>Security Threat Report</strong><br>
-                Report from <strong>{START_DATE}</strong> to <strong>{END_DATE}</strong>
+            <!-- Header with logo and title -->
+            <div class="card">
+                <div class="header">
+                    <div style="flex:0 0 auto;">
+                        <img src="https://office.zergaw.com/web/image/website/1/logo/" alt="Logo" style="height:70px; object-fit:contain;">
+                    </div>
+                    <div class="title-block">
+                        <div style="font-size:22px; font-weight:bold; margin-bottom:4px;">{title_text}</div>
+                        <div style="font-size:16px; color:#444; margin-bottom:6px;">{subtitle}</div>
+                        <div class="small">Report from <strong>{START_DATE}</strong> to <strong>{END_DATE}</strong></div>
+                    </div>
+                </div>
             </div>
 
+            <!-- Overview / Security Update -->
             <div class="card">
-                <h2>Security Overview</h2>
+                <h2>{subtitle}</h2>
                 <p><strong>Total Attacks:</strong> {stats["total_attacks"]}</p>
                 <p><strong>Unique Attack Types:</strong> {len(stats["attack_types"])}</p>
                 <p><strong>Unique Attackers:</strong> {len(stats["top_attackers"])}</p>
@@ -295,6 +342,11 @@ def build_html_report(attacks, stats):
                     <tbody>{recent_attacks_rows}</tbody>
                 </table>
             </div>
+
+            <div class="card" style="text-align:right; font-size:11px; color:#666;">
+                <div>Generated on {datetime.datetime.now().strftime("%d/%b/%Y")}</div>
+                <div style="margin-top:4px;">Time: {datetime.datetime.now().strftime("%H:%M:%S")}</div>
+            </div>
         </div>
     </body>
     </html>
@@ -318,8 +370,9 @@ def main():
     attacks = parse_modsec_log()
     stats = generate_stats(attacks)
     html_report = build_html_report(attacks, stats)
+    subject = f"Weekly Security Update for your site: {DOMAIN} - {datetime.datetime.now().strftime('%b %d, %Y')}"
     send_email(
-        f"Security Threat Report - {DOMAIN} - {datetime.datetime.now().strftime('%b %d')}",
+        subject,
         html_report,
     )
     print(
