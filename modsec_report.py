@@ -1,4 +1,4 @@
-#!/usr/bin/env python3 
+#!/usr/bin/env python3
 import re
 import smtplib
 import requests
@@ -10,27 +10,31 @@ import datetime
 import os
 import base64
 import mimetypes
+import sys
 
 # ==============================
-# Config
+# Config (customize as needed)
 # ==============================
 LOG_FILE = "/usr/local/apache/logs/modsec_audit.log"
-DOMAIN = "zpanel.site"  # replace with the actual domain, e.g., "abc.com"
+DOMAIN = "zpanel.site"  # replace with actual domain, e.g., "abc.com"
 SMTP_SERVER = "cloud.zergaw.com"
 SMTP_PORT = 587
 SMTP_USER = "security.update@zergaw.com"
 SMTP_PASS = "YOUR_PASSWORD"
 TO_EMAIL = "recipient@example.com"
 
-# Local logo path; if provided and readable, it will be embedded inline. Example: "/usr/local/share/logo.png"
-LOGO_PATH = "/path/to/logo.png"  # <- set this to your local logo file
+# Logo: expects logo.png in same folder as this script by default
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+LOGO_PATH = os.environ.get("LOGO_PATH") or os.path.join(SCRIPT_DIR, "logo.png")
 
-# Date Range (Default: last 7 days)
+# Date Range (default: last 7 days)
 END_DATE = datetime.date.today()
 START_DATE = END_DATE - datetime.timedelta(days=7)
 # ==============================
 
-# 🌍 Get country for IP with caching
+# ------------------------------
+# Utilities
+# ------------------------------
 @lru_cache(maxsize=200)
 def get_ip_country(ip):
     """Return country name for given IP."""
@@ -44,19 +48,23 @@ def get_ip_country(ip):
         return "Local Network"
     try:
         resp = requests.get(
-            f"http://ip-api.com/json/{ip}?fields=status,country", timeout=3
+            f"http://ip-api.com/json/{ip}?fields=status,country}", timeout=3
         )
         data = resp.json()
         if data.get("status") == "success":
             return data.get("country", "Unknown")
-    except:
+    except Exception:
         pass
     return "Unknown"
 
 def parse_modsec_log():
     """Parse ModSecurity log for the given domain and date range."""
-    with open(LOG_FILE, "r", errors="ignore") as f:
-        content = f.read()
+    try:
+        with open(LOG_FILE, "r", errors="ignore") as f:
+            content = f.read()
+    except Exception as e:
+        print(f"[ERROR] cannot read log file {LOG_FILE}: {e}", file=sys.stderr)
+        return []
 
     blocks = re.split(r"\n--[a-f0-9]+-A--", content)
     attacks = []
@@ -65,15 +73,12 @@ def parse_modsec_log():
         if f"Host: {DOMAIN}" not in block:
             continue
 
-        # Extract timestamp
-        ts_match = re.search(
-            r"\[(\d{2}/\w+/\d{4}):(\d{2}:\d{2}:\d{2})", block
-        )
+        ts_match = re.search(r"\[(\d{2}/\w+/\d{4}):(\d{2}:\d{2}:\d{2})", block)
         if not ts_match:
             continue
 
-        timestamp_str = ts_match.group(1)  # Example: 01/Aug/2025
-        time_str = ts_match.group(2)       # Example: 11:43:15
+        timestamp_str = ts_match.group(1)  # e.g., 01/Aug/2025
+        time_str = ts_match.group(2)       # e.g., 11:43:15
 
         try:
             attack_datetime = datetime.datetime.strptime(
@@ -82,7 +87,6 @@ def parse_modsec_log():
         except ValueError:
             continue
 
-        # Filter by date range
         if not (START_DATE <= attack_datetime.date() <= END_DATE):
             continue
 
@@ -95,11 +99,9 @@ def parse_modsec_log():
         if ip_match:
             attacker_ip = ip_match.group(1)
 
-        country = get_ip_country(attacker_ip)  # 🌍 Get country
+        country = get_ip_country(attacker_ip)
 
-        req_match = re.search(
-            r"(GET|POST|HEAD|PUT|DELETE|OPTIONS) ([^\s]+) HTTP", block
-        )
+        req_match = re.search(r"(GET|POST|HEAD|PUT|DELETE|OPTIONS) ([^\s]+) HTTP", block)
         request_line = (
             f"{req_match.group(1)} {req_match.group(2)}"
             if req_match
@@ -111,19 +113,16 @@ def parse_modsec_log():
             continue
 
         for msg in messages:
-            attacks.append(
-                {
-                    "date": attack_datetime.strftime("%d/%b/%Y"),  # ✅ date only
-                    "time": attack_datetime.strftime("%H:%M:%S"),  # ✅ time only
-                    "ip": attacker_ip,
-                    "country": country,
-                    "request": request_line,
-                    "message": msg,
-                    "_datetime": attack_datetime,  # for sorting
-                }
-            )
+            attacks.append({
+                "date": attack_datetime.strftime("%d/%b/%Y"),
+                "time": attack_datetime.strftime("%H:%M:%S"),
+                "ip": attacker_ip,
+                "country": country,
+                "request": request_line,
+                "message": msg,
+                "_datetime": attack_datetime,
+            })
 
-    # sort newest first
     attacks.sort(key=lambda a: a["_datetime"], reverse=True)
     return attacks
 
@@ -144,14 +143,13 @@ def generate_stats(attacks):
         try:
             dt = datetime.datetime.strptime(f"{attack['date']} {attack['time']}", "%d/%b/%Y %H:%M:%S")
             stats["hourly_distribution"][dt.hour] += 1
-        except:
+        except Exception:
             pass
 
         if attack["request"] != "N/A":
             method = attack["request"].split()[0]
             stats["methods"][method] += 1
 
-        # Enhanced severity classification
         msg_lower = attack["message"].lower()
         if "sql injection" in msg_lower or "rce" in msg_lower or "remote code execution" in msg_lower:
             stats["by_severity"]["Critical"] += 1
@@ -168,31 +166,30 @@ def generate_stats(attacks):
     stats["top_5_attackers"] = sorted(
         stats["top_attackers"].items(), key=lambda x: x[1], reverse=True
     )[:5]
-
     return stats
 
 def build_html_report(attacks, stats):
     title_text = f"Weekly security update for your site: {DOMAIN}"
     subtitle = "Zergaw Cloud WAF Security Update"
-    date_range_str = f"{START_DATE} to {END_DATE}"
 
-    # Determine logo src: prefer local embedded, fallback remote
-    def get_logo_src():
-        if LOGO_PATH:
-            try:
-                if os.path.isfile(LOGO_PATH):
-                    with open(LOGO_PATH, "rb") as f:
-                        data = f.read()
-                    mime, _ = mimetypes.guess_type(LOGO_PATH)
-                    if not mime:
-                        mime = "image/png"
-                    b64 = base64.b64encode(data).decode("ascii")
-                    return f"data:{mime};base64,{b64}"
-            except Exception:
-                pass
-        return "https://office.zergaw.com/web/image/website/1/logo/"
-
-    logo_src = get_logo_src()
+    # Build logo HTML: embed local logo if possible, else fallback to domain text
+    logo_html = ""
+    if os.path.isfile(LOGO_PATH):
+        try:
+            with open(LOGO_PATH, "rb") as f:
+                raw = f.read()
+            mime_type, _ = mimetypes.guess_type(LOGO_PATH)
+            if not mime_type:
+                mime_type = "image/png"
+            b64 = base64.b64encode(raw).decode("ascii")
+            logo_src = f"data:{mime_type};base64,{b64}"
+            logo_html = f'<img src="{logo_src}" alt="Logo" style="height:70px; object-fit:contain;">'
+        except Exception as e:
+            print(f"[WARN] failed to embed logo from {LOGO_PATH}: {e}", file=sys.stderr)
+            logo_html = f'<div style="font-size:20px;font-weight:bold;">{DOMAIN}</div>'
+    else:
+        print(f"[WARN] logo file not found at {LOGO_PATH}", file=sys.stderr)
+        logo_html = f'<div style="font-size:20px;font-weight:bold;">{DOMAIN}</div>'
 
     if not attacks:
         return f"""
@@ -202,27 +199,35 @@ def build_html_report(attacks, stats):
                 body {{ font-family: Arial, sans-serif; background:#f5f5f5; }}
                 .container {{ max-width: 900px; margin: auto; padding: 20px; }}
                 .card {{ background: white; border-radius: 8px; padding: 20px; margin-bottom: 30px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); }}
-                h1 {{ margin:0; }}
-                .header {{ display: flex; align-items: center; gap: 20px; }}
+                h2 {{ margin-top:0; }}
+                .header {{ display: flex; align-items: center; gap: 20px; flex-wrap: wrap; }}
+                .title-block {{ flex:1; min-width:220px; }}
                 .small {{ font-size:12px; color:#666; }}
             </style>
         </head>
         <body>
             <div class="container">
-                <div class="card header">
-                    <div style="flex:0 0 auto;">
-                        <img src="{logo_src}" alt="Logo" style="height:60px; object-fit:contain;">
-                    </div>
-                    <div style="flex:1;">
-                        <div style="font-size:20px; font-weight:bold;">{title_text}</div>
-                        <div style="font-size:14px; margin-top:4px;">{subtitle}</div>
-                        <div class="small" style="margin-top:6px;">Report from <strong>{START_DATE}</strong> to <strong>{END_DATE}</strong></div>
+                <!-- Header -->
+                <div class="card">
+                    <div class="header">
+                        <div style="flex:0 0 auto;">
+                            {logo_html}
+                        </div>
+                        <div class="title-block">
+                            <div style="font-size:22px; font-weight:bold; margin-bottom:4px;">{title_text}</div>
+                            <div style="font-size:16px; color:#444; margin-bottom:6px;">{subtitle}</div>
+                            <div class="small">Report from <strong>{START_DATE}</strong> to <strong>{END_DATE}</strong></div>
+                        </div>
                     </div>
                 </div>
+
+                <!-- No events -->
                 <div class="card">
-                    <h2>No Security Events</h2>
+                    <h2>{subtitle}</h2>
                     <p>This is a weekly security update for <strong>{DOMAIN}</strong>. There were no recorded security events from <strong>{START_DATE}</strong> to <strong>{END_DATE}</strong>.</p>
                 </div>
+
+                <!-- Footer -->
                 <div class="card" style="text-align:right; font-size:11px; color:#666;">
                     <div>Generated on {datetime.datetime.now().strftime("%d/%b/%Y")}</div>
                     <div style="margin-top:4px;">Time: {datetime.datetime.now().strftime("%H:%M:%S")}</div>
@@ -233,36 +238,35 @@ def build_html_report(attacks, stats):
         </html>
         """
 
-    # Calculate severity counts
+    # Severity counts
     severity_counts = {
         "Critical": stats["by_severity"].get("Critical", 0),
         "High": stats["by_severity"].get("High", 0),
         "Medium": stats["by_severity"].get("Medium", 0),
-        "Low": stats["by_severity"].get("Low", 0)
+        "Low": stats["by_severity"].get("Low", 0),
     }
 
-    # Severity cards HTML
     severity_cards = f"""
     <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; margin: 20px 0;">
-        <div style="background: linear-gradient(135deg, #ff4d4d, #ff1a1a); padding: 15px; border-radius: 8px; color: white; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+        <div style="background: linear-gradient(135deg, #ff4d4d, #ff1a1a); padding: 15px; border-radius: 8px; color: white; text-align: center;">
             <div style="font-size: 12px; opacity: 0.9;">CRITICAL</div>
             <div style="font-size: 24px; font-weight: bold;">{severity_counts['Critical']}</div>
-            <div style="font-size: 11px;">{(severity_counts['Critical']/stats['total_attacks'])*100:.1f}%</div>
+            <div style="font-size: 11px;">{(severity_counts['Critical'] / stats['total_attacks']) * 100 if stats['total_attacks'] else 0:.1f}%</div>
         </div>
-        <div style="background: linear-gradient(135deg, #ff9966, #ff5e62); padding: 15px; border-radius: 8px; color: white; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+        <div style="background: linear-gradient(135deg, #ff9966, #ff5e62); padding: 15px; border-radius: 8px; color: white; text-align: center;">
             <div style="font-size: 12px; opacity: 0.9;">HIGH</div>
             <div style="font-size: 24px; font-weight: bold;">{severity_counts['High']}</div>
-            <div style="font-size: 11px;">{(severity_counts['High']/stats['total_attacks']) * 100:.1f}%</div>
+            <div style="font-size: 11px;">{(severity_counts['High'] / stats['total_attacks']) * 100 if stats['total_attacks'] else 0:.1f}%</div>
         </div>
-        <div style="background: linear-gradient(135deg, #ffcc00, #ffaa00); padding: 15px; border-radius: 8px; color: white; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+        <div style="background: linear-gradient(135deg, #ffcc00, #ffaa00); padding: 15px; border-radius: 8px; color: white; text-align: center;">
             <div style="font-size: 12px; opacity: 0.9;">MEDIUM</div>
             <div style="font-size: 24px; font-weight: bold;">{severity_counts['Medium']}</div>
-            <div style="font-size: 11px;">{(severity_counts['Medium']/stats['total_attacks']) * 100:.1f}%</div>
+            <div style="font-size: 11px;">{(severity_counts['Medium'] / stats['total_attacks']) * 100 if stats['total_attacks'] else 0:.1f}%</div>
         </div>
-        <div style="background: linear-gradient(135deg, #66cc66, #2eb82e); padding: 15px; border-radius: 8px; color: white; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+        <div style="background: linear-gradient(135deg, #66cc66, #2eb82e); padding: 15px; border-radius: 8px; color: white; text-align: center;">
             <div style="font-size: 12px; opacity: 0.9;">LOW</div>
             <div style="font-size: 24px; font-weight: bold;">{severity_counts['Low']}</div>
-            <div style="font-size: 11px;">{(severity_counts['Low']/stats['total_attacks']) * 100:.1f}%</div>
+            <div style="font-size: 11px;">{(severity_counts['Low'] / stats['total_attacks']) * 100 if stats['total_attacks'] else 0:.1f}%</div>
         </div>
     </div>
     """
@@ -285,7 +289,7 @@ def build_html_report(attacks, stats):
     top_attackers_rows = "".join(
         f"<tr><td>{ip}<br><small>{country}</small></td>"
         f"<td>{count}</td>"
-        f"<td>{(count / stats['total_attacks']) * 100:.1f}%</td></tr>"
+        f"<td>{(count / stats['total_attacks']) * 100 if stats['total_attacks'] else 0:.1f}%</td></tr>"
         for (ip, country), count in stats["top_5_attackers"]
     )
 
@@ -325,11 +329,11 @@ def build_html_report(attacks, stats):
     </head>
     <body>
         <div class="container">
-            <!-- Header with logo and title -->
+            <!-- Header -->
             <div class="card">
                 <div class="header">
                     <div style="flex:0 0 auto;">
-                        <img src="{logo_src}" alt="Logo" style="height:70px; object-fit:contain;">
+                        {logo_html}
                     </div>
                     <div class="title-block">
                         <div style="font-size:22px; font-weight:bold; margin-bottom:4px;">{title_text}</div>
@@ -339,21 +343,22 @@ def build_html_report(attacks, stats):
                 </div>
             </div>
 
-            <!-- Overview / Security Update -->
+            <!-- Overview -->
             <div class="card">
                 <h2>{subtitle}</h2>
                 <p><strong>Total Attacks:</strong> {stats["total_attacks"]}</p>
                 <p><strong>Unique Attack Types:</strong> {len(stats["attack_types"])}</p>
                 <p><strong>Unique Attackers:</strong> {len(stats["top_attackers"])}</p>
-                
                 {severity_cards}
             </div>
 
+            <!-- Top Attack Types -->
             <div class="card">
                 <h2>Top Attack Types</h2>
                 {attack_types_chart}
             </div>
 
+            <!-- Top Attackers -->
             <div class="card">
                 <h2>Top Attackers</h2>
                 <table>
@@ -362,6 +367,7 @@ def build_html_report(attacks, stats):
                 </table>
             </div>
 
+            <!-- Recent Attacks -->
             <div class="card">
                 <h2>Recent Attacks</h2>
                 <table>
@@ -374,6 +380,7 @@ def build_html_report(attacks, stats):
                 </table>
             </div>
 
+            <!-- Footer -->
             <div class="card" style="text-align:right; font-size:11px; color:#666;">
                 <div>Generated on {datetime.datetime.now().strftime("%d/%b/%Y")}</div>
                 <div style="margin-top:4px;">Time: {datetime.datetime.now().strftime("%H:%M:%S")}</div>
@@ -403,13 +410,8 @@ def main():
     stats = generate_stats(attacks)
     html_report = build_html_report(attacks, stats)
     subject = f"Weekly Security Update for your site: {DOMAIN} - {datetime.datetime.now().strftime('%b %d, %Y')}"
-    send_email(
-        subject,
-        html_report,
-    )
-    print(
-        f"Report sent to {TO_EMAIL} with {len(attacks)} attack entries."
-    )
+    send_email(subject, html_report)
+    print(f"Report sent to {TO_EMAIL} with {len(attacks)} attack entries.")
 
 if __name__ == "__main__":
     main()
