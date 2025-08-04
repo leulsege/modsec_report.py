@@ -7,6 +7,9 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from collections import defaultdict
 import datetime
+import os
+import base64
+import mimetypes
 
 # ==============================
 # Config
@@ -18,6 +21,9 @@ SMTP_PORT = 587
 SMTP_USER = "security.update@zergaw.com"
 SMTP_PASS = "YOUR_PASSWORD"
 TO_EMAIL = "recipient@example.com"
+
+# Local logo path; if provided and readable, it will be embedded inline. Example: "/usr/local/share/logo.png"
+LOGO_PATH = "/path/to/logo.png"  # <- set this to your local logo file
 
 # Date Range (Default: last 7 days)
 END_DATE = datetime.date.today()
@@ -170,6 +176,24 @@ def build_html_report(attacks, stats):
     subtitle = "Zergaw Cloud WAF Security Update"
     date_range_str = f"{START_DATE} to {END_DATE}"
 
+    # Determine logo src: prefer local embedded, fallback remote
+    def get_logo_src():
+        if LOGO_PATH:
+            try:
+                if os.path.isfile(LOGO_PATH):
+                    with open(LOGO_PATH, "rb") as f:
+                        data = f.read()
+                    mime, _ = mimetypes.guess_type(LOGO_PATH)
+                    if not mime:
+                        mime = "image/png"
+                    b64 = base64.b64encode(data).decode("ascii")
+                    return f"data:{mime};base64,{b64}"
+            except Exception:
+                pass
+        return "https://office.zergaw.com/web/image/website/1/logo/"
+
+    logo_src = get_logo_src()
+
     if not attacks:
         return f"""
         <html>
@@ -187,7 +211,7 @@ def build_html_report(attacks, stats):
             <div class="container">
                 <div class="card header">
                     <div style="flex:0 0 auto;">
-                        <img src="https://office.zergaw.com/web/image/website/1/logo/" alt="Logo" style="height:60px; object-fit:contain;">
+                        <img src="{logo_src}" alt="Logo" style="height:60px; object-fit:contain;">
                     </div>
                     <div style="flex:1;">
                         <div style="font-size:20px; font-weight:bold;">{title_text}</div>
@@ -198,6 +222,11 @@ def build_html_report(attacks, stats):
                 <div class="card">
                     <h2>No Security Events</h2>
                     <p>This is a weekly security update for <strong>{DOMAIN}</strong>. There were no recorded security events from <strong>{START_DATE}</strong> to <strong>{END_DATE}</strong>.</p>
+                </div>
+                <div class="card" style="text-align:right; font-size:11px; color:#666;">
+                    <div>Generated on {datetime.datetime.now().strftime("%d/%b/%Y")}</div>
+                    <div style="margin-top:4px;">Time: {datetime.datetime.now().strftime("%H:%M:%S")}</div>
+                    <div style="margin-top:6px; font-weight:bold;">Zergaw Cloud</div>
                 </div>
             </div>
         </body>
@@ -223,17 +252,17 @@ def build_html_report(attacks, stats):
         <div style="background: linear-gradient(135deg, #ff9966, #ff5e62); padding: 15px; border-radius: 8px; color: white; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
             <div style="font-size: 12px; opacity: 0.9;">HIGH</div>
             <div style="font-size: 24px; font-weight: bold;">{severity_counts['High']}</div>
-            <div style="font-size: 11px;">{(severity_counts['High']/stats['total_attacks'])*100:.1f}%</div>
+            <div style="font-size: 11px;">{(severity_counts['High']/stats['total_attacks']) * 100:.1f}%</div>
         </div>
         <div style="background: linear-gradient(135deg, #ffcc00, #ffaa00); padding: 15px; border-radius: 8px; color: white; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
             <div style="font-size: 12px; opacity: 0.9;">MEDIUM</div>
             <div style="font-size: 24px; font-weight: bold;">{severity_counts['Medium']}</div>
-            <div style="font-size: 11px;">{(severity_counts['Medium']/stats['total_attacks'])*100:.1f}%</div>
+            <div style="font-size: 11px;">{(severity_counts['Medium']/stats['total_attacks']) * 100:.1f}%</div>
         </div>
         <div style="background: linear-gradient(135deg, #66cc66, #2eb82e); padding: 15px; border-radius: 8px; color: white; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
             <div style="font-size: 12px; opacity: 0.9;">LOW</div>
             <div style="font-size: 24px; font-weight: bold;">{severity_counts['Low']}</div>
-            <div style="font-size: 11px;">{(severity_counts['Low']/stats['total_attacks'])*100:.1f}%</div>
+            <div style="font-size: 11px;">{(severity_counts['Low']/stats['total_attacks']) * 100:.1f}%</div>
         </div>
     </div>
     """
@@ -300,7 +329,7 @@ def build_html_report(attacks, stats):
             <div class="card">
                 <div class="header">
                     <div style="flex:0 0 auto;">
-                        <img src="https://office.zergaw.com/web/image/website/1/logo/" alt="Logo" style="height:70px; object-fit:contain;">
+                        <img src="{logo_src}" alt="Logo" style="height:70px; object-fit:contain;">
                     </div>
                     <div class="title-block">
                         <div style="font-size:22px; font-weight:bold; margin-bottom:4px;">{title_text}</div>
@@ -348,6 +377,7 @@ def build_html_report(attacks, stats):
             <div class="card" style="text-align:right; font-size:11px; color:#666;">
                 <div>Generated on {datetime.datetime.now().strftime("%d/%b/%Y")}</div>
                 <div style="margin-top:4px;">Time: {datetime.datetime.now().strftime("%H:%M:%S")}</div>
+                <div style="margin-top:6px; font-weight:bold;">Zergaw Cloud</div>
             </div>
         </div>
     </body>
