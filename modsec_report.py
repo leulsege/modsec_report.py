@@ -5,11 +5,10 @@ import requests
 from functools import lru_cache
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.mime.image import MIMEImage
 from collections import defaultdict
 import datetime
 import os
-import base64
-import mimetypes
 import sys
 
 # ==============================
@@ -32,9 +31,6 @@ END_DATE = datetime.date.today()
 START_DATE = END_DATE - datetime.timedelta(days=7)
 # ==============================
 
-# ------------------------------
-# Utilities
-# ------------------------------
 @lru_cache(maxsize=200)
 def get_ip_country(ip):
     """Return country name for given IP."""
@@ -172,23 +168,12 @@ def build_html_report(attacks, stats):
     title_text = f"Weekly security update for your site: {DOMAIN}"
     subtitle = "Zergaw Cloud WAF Security Update"
 
-    # Build logo HTML: embed local logo if possible, else fallback to domain text
+    # logo referenced by CID in the email; fallback text if missing
+    logo_html = f'<div style="font-size:20px;font-weight:bold;">{DOMAIN}</div>'
     if os.path.isfile(LOGO_PATH):
-        try:
-            with open(LOGO_PATH, "rb") as f:
-                raw = f.read()
-            mime_type, _ = mimetypes.guess_type(LOGO_PATH)
-            if not mime_type:
-                mime_type = "image/png"
-            b64 = base64.b64encode(raw).decode("ascii")
-            logo_src = f"data:{mime_type};base64,{b64}"
-            logo_html = f'<img src="{logo_src}" alt="Logo" style="height:70px; object-fit:contain;">'
-        except Exception as e:
-            print(f"[WARN] failed to embed logo from {LOGO_PATH}: {e}", file=sys.stderr)
-            logo_html = f'<div style="font-size:20px;font-weight:bold;">{DOMAIN}</div>'
+        logo_html = '<img src="cid:logo" alt="Logo" style="height:70px; object-fit:contain;">'
     else:
         print(f"[WARN] logo file not found at {LOGO_PATH}", file=sys.stderr)
-        logo_html = f'<div style="font-size:20px;font-weight:bold;">{DOMAIN}</div>'
 
     if not attacks:
         return f"""
@@ -391,17 +376,36 @@ def build_html_report(attacks, stats):
     return html
 
 def send_email(subject, html_content):
-    msg = MIMEMultipart("alternative")
-    msg["From"] = SMTP_USER
-    msg["To"] = TO_EMAIL
-    msg["Subject"] = subject
-    msg.attach(MIMEText("Please view this email in HTML format.", "plain"))
-    msg.attach(MIMEText(html_content, "html"))
+    # Create a related multipart to allow inline image
+    related = MIMEMultipart("related")
+    related["From"] = SMTP_USER
+    related["To"] = TO_EMAIL
+    related["Subject"] = subject
+
+    # Alternative part (plain + html)
+    alternative = MIMEMultipart("alternative")
+    plain = MIMEText("Please view this email in HTML format.", "plain")
+    html = MIMEText(html_content, "html")
+    alternative.attach(plain)
+    alternative.attach(html)
+    related.attach(alternative)
+
+    # Attach logo inline if available
+    if os.path.isfile(LOGO_PATH):
+        try:
+            with open(LOGO_PATH, "rb") as imgf:
+                img_data = imgf.read()
+            mime_image = MIMEImage(img_data)
+            mime_image.add_header("Content-ID", "<logo>")
+            mime_image.add_header("Content-Disposition", "inline", filename=os.path.basename(LOGO_PATH))
+            related.attach(mime_image)
+        except Exception as e:
+            print(f"[WARN] failed to attach logo image: {e}", file=sys.stderr)
 
     with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
         server.starttls()
         server.login(SMTP_USER, SMTP_PASS)
-        server.sendmail(SMTP_USER, TO_EMAIL, msg.as_string())
+        server.sendmail(SMTP_USER, TO_EMAIL, related.as_string())
 
 def main():
     attacks = parse_modsec_log()
