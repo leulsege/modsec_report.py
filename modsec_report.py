@@ -48,7 +48,7 @@ def get_ip_country(ip):
         return "Local Network"
     try:
         resp = requests.get(
-            f"http://ip-api.com/json/{ip}?fields=status,country}", timeout=3
+            f"http://ip-api.com/json/{ip}?fields=status,country", timeout=3
         )
         data = resp.json()
         if data.get("status") == "success":
@@ -173,7 +173,6 @@ def build_html_report(attacks, stats):
     subtitle = "Zergaw Cloud WAF Security Update"
 
     # Build logo HTML: embed local logo if possible, else fallback to domain text
-    logo_html = ""
     if os.path.isfile(LOGO_PATH):
         try:
             with open(LOGO_PATH, "rb") as f:
@@ -238,7 +237,6 @@ def build_html_report(attacks, stats):
         </html>
         """
 
-    # Severity counts
     severity_counts = {
         "Critical": stats["by_severity"].get("Critical", 0),
         "High": stats["by_severity"].get("High", 0),
