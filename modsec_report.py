@@ -113,9 +113,12 @@ def parse_modsec_log():
                     "country": country,
                     "request": request_line,
                     "message": msg,
+                    "_datetime": attack_datetime,  # for sorting
                 }
             )
 
+    # sort newest first
+    attacks.sort(key=lambda a: a["_datetime"], reverse=True)
     return attacks
 
 def generate_stats(attacks):
@@ -202,7 +205,7 @@ def build_html_report(attacks, stats):
 
     attack_types_chart = ""
     for msg, count in stats["top_5_attack_types"]:
-        percentage = (count / stats["total_attacks"]) * 100
+        percentage = (count / stats["total_attacks"]) * 100 if stats["total_attacks"] else 0
         attack_types_chart += f"""
         <div style="margin-bottom: 15px;">
             <div style="display: flex; justify-content: space-between; font-size: 13px;">
@@ -220,6 +223,7 @@ def build_html_report(attacks, stats):
         for (ip, country), count in stats["top_5_attackers"]
     )
 
+    # Recent attacks: already sorted descending in parse, take first 10 (latest)
     recent_attacks_rows = "".join(
         f"""
         <tr>
