@@ -254,8 +254,10 @@ def build_html_report(attacks, stats):
         """
 
     top_attackers_rows = "".join(
-        f"<tr><td>{ip}<br><small>{country}</small></td><td>{count}</td><td>{(count / stats['total_attacks']) * 100:.1f}%</td></tr>"
-        for (ip, country), count in stats["top_attackers"]
+        f"<tr><td>{ip}<br><small>{country}</small></td>"
+        f"<td>{count}</td>"
+        f"<td>{(count / stats['total_attacks']) * 100:.1f}%</td></tr>"
+        for (ip, country), count in stats["top_5_attackers"]
     )
 
     recent_attacks_rows = "".join(
