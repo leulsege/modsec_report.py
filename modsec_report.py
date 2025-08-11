@@ -292,11 +292,9 @@ def _parse_log_content(content: str) -> Dict[str, List[dict]]:
 def _read_log_content() -> str:
     """Read the log content based on INCREMENTAL setting."""
     if not INCREMENTAL:
-        # Always full read (ensures complete week coverage)
         with open(LOG_FILE, "r", errors="ignore") as f:
             return f.read()
 
-    # Incremental mode (optional)
     file_size = os.path.getsize(LOG_FILE)
     last_position = get_file_position(LOG_FILE)
     with open(LOG_FILE, "r", errors="ignore") as f:
@@ -305,7 +303,6 @@ def _read_log_content() -> str:
             content = f.read()
         else:
             content = f.read()
-        # save new position
         try:
             save_file_position(LOG_FILE, file_size)
         except Exception:
@@ -431,63 +428,88 @@ def generate_stats(attacks: List[dict]) -> dict:
     return stats
 
 # ---------- HTML ----------
+def _logo_block_html() -> str:
+    """Return a robust logo block that renders consistently across Outlook/Gmail."""
+    # Use table layout + width attribute + inline styles
+    return """
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+  <tr>
+    <td align="left" valign="middle" style="padding:0; margin:0;">
+      <img src="cid:logo" alt="Logo" width="120" height="auto"
+           style="display:block; max-width:120px; height:auto; border:0; outline:none; text-decoration:none; -ms-interpolation-mode:bicubic;" />
+    </td>
+  </tr>
+</table>
+""".strip()
+
+def _header_table_html(domain: str, subtitle: str, start_date: dt.date, end_date: dt.date) -> str:
+    """Header using tables (no flex), with fixed logo size and reliable spacing."""
+    logo_html = _logo_block_html()
+    return f"""
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;">
+  <tr>
+    <td style="padding: 20px; border:1px solid #eee; border-radius:8px;">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+        <tr>
+          <td width="140" valign="middle" style="padding-right:20px;">
+            {logo_html}
+          </td>
+          <td valign="middle">
+            <div style="font-family: Arial, sans-serif; font-size:16px; color:#444; margin:0; padding:0;">
+              Weekly security update for your site:
+            </div>
+            <div style="font-family: Arial, sans-serif; font-size:22px; font-weight:bold; color:#222; margin:4px 0 6px 0;">
+              {domain}
+            </div>
+            <div style="font-family: Arial, sans-serif; font-size:14px; color:#444; margin:0 0 6px 0;">
+              {subtitle}
+            </div>
+            <div style="font-family: Arial, sans-serif; font-size:12px; color:#666; margin:0;">
+              Report from <strong>{start_date}</strong> to <strong>{end_date}</strong>
+            </div>
+          </td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+</table>
+""".strip()
+
 def build_html_report(domain: str, attacks: List[dict], stats: dict) -> str:
-    """Generate HTML email report."""
+    """Generate HTML email report with Outlook/Gmail-safe logo and spacing."""
     subtitle = "Zergaw Cloud WAF Security Update"
-
-    # Logo handling
-    logo_html = f'<div style="font-size:20px;font-weight:bold;">{domain}</div>'
-    if os.path.isfile(LOGO_PATH):
-        logo_html = '<img src="cid:logo" alt="Logo" style="height:35px; object-fit:contain;">'
-
-    title_text_html = (
-        '<span style="font-size:18px; font-weight:normal;">Weekly security update for your site:</span> '
-        f'<span style="font-size:22px; font-weight:bold; color:#222;">{domain}</span>'
-    )
+    header_html = _header_table_html(domain, subtitle, START_DATE, END_DATE)
 
     if not attacks:
         return f"""
         <html>
         <head>
-            <style>
-                body {{ font-family: Arial, sans-serif; background:#f5f5f5; }}
-                .container {{ max-width: 900px; margin: auto; padding: 20px; }}
-                .card {{ background: white; border-radius: 8px; padding: 20px; margin-bottom: 30px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); }}
-                h2 {{ margin-top:0; }}
-                .header {{ display: flex; align-items: center; gap: 20px; flex-wrap: wrap; }}
-                .title-block {{ flex:1; min-width:220px; }}
-                .small {{ font-size:12px; color:#666; }}
-            </style>
+          <meta http-equiv="x-ua-compatible" content="ie=edge">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
         </head>
-        <body>
-            <div class="container">
-                <!-- Header -->
-                <div class="card">
-                    <div class="header">
-                        <div style="flex:0 0 auto;">
-                            {logo_html}
-                        </div>
-                        <div class="title-block">
-                            <div style="margin-bottom:4px;">{title_text_html}</div>
-                            <div style="font-size:16px; color:#444; margin-bottom:6px;">{subtitle}</div>
-                            <div class="small">Report from <strong>{START_DATE}</strong> to <strong>{END_DATE}</strong></div>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- No events -->
-                <div class="card">
-                    <h2>{subtitle}</h2>
-                    <p>This is a weekly security update for <strong>{domain}</strong>. There were no recorded security events from <strong>{START_DATE}</strong> to <strong>{END_DATE}</strong>.</p>
-                </div>
-
-                <!-- Footer -->
-                <div class="card" style="text-align:right; font-size:11px; color:#666;">
-                    <div>Generated on {datetime.now().strftime("%d/%b/%Y")}</div>
-                    <div style="margin-top:4px;">Time: {datetime.now().strftime("%H:%M:%S")}</div>
-                    <div style="margin-top:6px; font-weight:bold;">Zergaw Cloud</div>
-                </div>
-            </div>
+        <body style="margin:0; padding:0; background:#f5f5f5;">
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+            <tr>
+              <td align="center" style="padding:24px;">
+                <table role="presentation" width="900" cellspacing="0" cellpadding="0" border="0" style="background:#ffffff; border-radius:8px; box-shadow:0 2px 8px rgba(0,0,0,0.05);">
+                  <tr><td style="padding:0 20px 20px 20px;">{header_html}</td></tr>
+                  <tr>
+                    <td style="padding:20px; font-family:Arial, sans-serif; font-size:14px; color:#333;">
+                      <h2 style="margin:0 0 12px 0; font-size:18px; font-weight:bold; color:#333;">{subtitle}</h2>
+                      <p style="margin:0;">This is a weekly security update for <strong>{domain}</strong>. There were no recorded security events from <strong>{START_DATE}</strong> to <strong>{END_DATE}</strong>.</p>
+                    </td>
+                  </tr>
+                  <tr>
+                    <td align="right" style="padding:16px 20px; font-family:Arial, sans-serif; font-size:11px; color:#666; border-top:1px solid #eee;">
+                      <div>Generated on {datetime.now().strftime("%d/%b/%Y")}</div>
+                      <div style="margin-top:4px;">Time: {datetime.now().strftime("%H:%M:%S")}</div>
+                      <div style="margin-top:6px; font-weight:bold;">Zergaw Cloud</div>
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+          </table>
         </body>
         </html>
         """
@@ -500,71 +522,53 @@ def build_html_report(domain: str, attacks: List[dict], stats: dict) -> str:
     }
     total = stats["total_attacks"]
 
-    severity_cards = f"""
-    <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; margin: 20px 0;">
-        <div style="background: linear-gradient(135deg, #ff4d4d, #ff1a1a); padding: 15px; border-radius: 8px; color: white; text-align: center;">
-            <div style="font-size: 12px; opacity: 0.9;">CRITICAL</div>
-            <div style="font-size: 24px; font-weight: bold;">{fmt_num(severity_counts['Critical'])}</div>
-            <div style="font-size: 11px;">{pct(severity_counts['Critical'], total)}</div>
-        </div>
-        <div style="background: linear-gradient(135deg, #ff9966, #ff5e62); padding: 15px; border-radius: 8px; color: white; text-align: center;">
-            <div style="font-size: 12px; opacity: 0.9;">HIGH</div>
-            <div style="font-size: 24px; font-weight: bold;">{fmt_num(severity_counts['High'])}</div>
-            <div style="font-size: 11px;">{pct(severity_counts['High'], total)}</div>
-        </div>
-        <div style="background: linear-gradient(135deg, #ffcc00, #ffaa00); padding: 15px; border-radius: 8px; color: white; text-align: center;">
-            <div style="font-size: 12px; opacity: 0.9;">MEDIUM</div>
-            <div style="font-size: 24px; font-weight: bold;">{fmt_num(severity_counts['Medium'])}</div>
-            <div style="font-size: 11px;">{pct(severity_counts['Medium'], total)}</div>
-        </div>
-        <div style="background: linear-gradient(135deg, #66cc66, #2eb82e); padding: 15px; border-radius: 8px; color: white; text-align: center;">
-            <div style="font-size: 12px; opacity: 0.9;">LOW</div>
-            <div style="font-size: 24px; font-weight: bold;">{fmt_num(severity_counts['Low'])}</div>
-            <div style="font-size: 11px;">{pct(severity_counts['Low'], total)}</div>
-        </div>
-    </div>
-    """
-
-    attack_types_chart = ""
-    for msg, count in stats["top_5_attack_types"]:
+    def bar(msg, count):
         percentage = (count / total) * 100 if total else 0
-        attack_types_chart += f"""
-        <div style="margin-bottom: 15px;">
-            <div style="display: flex; justify-content: space-between; font-size: 13px;">
-                <span>{msg}</span>
-                <span>{fmt_num(count)} ({percentage:.1f}%)</span>
+        return f"""
+        <tr>
+          <td style="padding:6px 0; font-family:Arial, sans-serif; font-size:13px; color:#333;">{msg}</td>
+          <td align="right" style="padding:6px 0; font-family:Arial, sans-serif; font-size:13px; color:#333; white-space:nowrap;">{fmt_num(count)} ({percentage:.1f}%)</td>
+        </tr>
+        <tr>
+          <td colspan="2" style="padding:0 0 10px 0;">
+            <div style="height:8px; background-color:#ddd; border-radius:4px; overflow:hidden;">
+              <div style="height:8px; width:{percentage}%; background-color:#e74c3c;"></div>
             </div>
-            <div style="height: 8px; background-color: #ddd; border-radius: 4px; overflow: hidden;">
-                <div style="height: 100%; width: {percentage}%; background-color: #e74c3c;"></div>
-            </div>
-        </div>
+          </td>
+        </tr>
         """
 
-    # Top attackers (apply limit here)
+    attack_types_chart = "".join(bar(msg, count) for msg, count in stats["top_5_attack_types"])
+
     attackers_sorted = stats.get("_all_attackers_sorted", [])
     if TOP_ATTACKERS_LIMIT > 0:
         attackers_sorted = attackers_sorted[:TOP_ATTACKERS_LIMIT]
 
     top_attackers_rows = "".join(
-        f"<tr><td>{ip}<br><small>{country}</small></td>"
-        f"<td>{fmt_num(count)}</td>"
-        f"<td>{pct(count, total)}</td></tr>"
+        f"<tr>"
+        f"<td style='padding:10px; font-family:Arial, sans-serif; font-size:13px; color:#333;'>{ip}<br><span style='font-size:11px; color:#777;'>{country}</span></td>"
+        f"<td style='padding:10px; font-family:Arial, sans-serif; font-size:13px; color:#333;'>{fmt_num(count)}</td>"
+        f"<td style='padding:10px; font-family:Arial, sans-serif; font-size:13px; color:#333;'>{pct(count, total)}</td>"
+        f"</tr>"
         for (ip, country), count in attackers_sorted
     )
 
-    # Recent attacks table (apply limit here)
     recent_attacks = attacks if RECENT_LIMIT == 0 else attacks[:RECENT_LIMIT]
     recent_attacks_rows = "".join(
         f"""
         <tr>
-            <td>
-                <div>{atk['date']}</div>
-                <div style="font-size:11px; color:#777;">{atk['time']}</div>
-            </td>
-            <td>{atk['ip']}<br><small>{atk.get('country','Unknown')}</small></td>
-            <td style="word-break:break-word;">{atk['request']}</td>
-            <td style="word-break:break-word;">{atk['message']}</td>
-            <td><span style="background-color:#e74c3c;color:white;padding:2px 8px;border-radius:12px;">BLOCKED</span></td>
+          <td style="padding:10px; font-family:Arial, sans-serif; font-size:13px; color:#333;">
+            <div>{atk['date']}</div>
+            <div style="font-size:11px; color:#777;">{atk['time']}</div>
+          </td>
+          <td style="padding:10px; font-family:Arial, sans-serif; font-size:13px; color:#333;">
+            {atk['ip']}<br><span style="font-size:11px; color:#777;">{atk.get('country','Unknown')}</span>
+          </td>
+          <td style="padding:10px; font-family:Arial, sans-serif; font-size:13px; color:#333; word-break:break-word;">{atk['request']}</td>
+          <td style="padding:10px; font-family:Arial, sans-serif; font-size:13px; color:#333; word-break:break-word;">{atk['message']}</td>
+          <td style="padding:10px; font-family:Arial, sans-serif; font-size:13px; color:#333;">
+            <span style="background-color:#e74c3c;color:#fff;padding:2px 8px;border-radius:12px; display:inline-block;">BLOCKED</span>
+          </td>
         </tr>
         """
         for atk in recent_attacks
@@ -573,81 +577,109 @@ def build_html_report(domain: str, attacks: List[dict], stats: dict) -> str:
     return f"""
     <html>
     <head>
-        <style>
-            body {{ font-family: Arial, sans-serif; background:#f5f5f5; }}
-            .container {{ max-width: 900px; margin: auto; padding: 20px; }}
-            .card {{ background: white; border-radius: 8px; padding: 20px; margin-bottom: 30px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); }}
-            h2 {{ border-bottom: 2px solid #eee; padding-bottom: 8px; color:#333; }}
-            table {{ width:100%; border-collapse: collapse; margin-top: 15px; }}
-            th, td {{ padding: 10px; text-align: left; border: 1px solid #ddd; vertical-align: top; }}
-            th {{ background-color: #f4f4f4; font-size: 13px; }}
-            tr:nth-child(even) {{ background-color: #fafafa; }}
-            td {{ font-size: 13px; }}
-            .header {{ display: flex; align-items: center; gap: 20px; flex-wrap: wrap; }}
-            .title-block {{ flex:1; min-width:220px; }}
-            .small {{ font-size:12px; color:#666; }}
-        </style>
+      <meta http-equiv="x-ua-compatible" content="ie=edge">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
     </head>
-    <body>
-        <div class="container">
-            <!-- Header -->
-            <div class="card">
-                <div class="header">
-                    <div style="flex:0 0 auto;">
-                        {logo_html}
-                    </div>
-                    <div class="title-block">
-                        <div style="margin-bottom:4px;">{title_text_html}</div>
-                        <div style="font-size:16px; color:#444; margin-bottom:6px;">{subtitle}</div>
-                        <div class="small">Report from <strong>{START_DATE}</strong> to <strong>{END_DATE}</strong></div>
-                    </div>
-                </div>
-            </div>
+    <body style="margin:0; padding:0; background:#f5f5f5;">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+        <tr>
+          <td align="center" style="padding:24px;">
+            <table role="presentation" width="900" cellspacing="0" cellpadding="0" border="0" style="background:#ffffff; border-radius:8px; box-shadow:0 2px 8px rgba(0,0,0,0.05);">
+              <tr><td style="padding:0 20px 20px 20px;">{header_html}</td></tr>
 
-            <!-- Overview -->
-            <div class="card">
-                <h2>Security Overview</h2>
-                <p><strong>Total Attacks:</strong> {fmt_num(stats["total_attacks"])}</p>
-                <p><strong>Unique Attack Types:</strong> {fmt_num(len(stats["attack_types"]))}</p>
-                <p><strong>Unique Attackers:</strong> {fmt_num(len(stats["top_attackers"]))}</p>
-                {severity_cards}
-            </div>
+              <!-- Overview -->
+              <tr>
+                <td style="padding:20px;">
+                  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;">
+                    <tr>
+                      <td colspan="2" style="font-family:Arial, sans-serif; font-size:18px; font-weight:bold; color:#333; padding-bottom:8px; border-bottom:2px solid #eee;">Security Overview</td>
+                    </tr>
+                    <tr>
+                      <td style="padding:12px 0; font-family:Arial, sans-serif; font-size:14px; color:#333;">
+                        <strong>Total Attacks:</strong> {fmt_num(stats["total_attacks"])}
+                        &nbsp;&nbsp;|&nbsp;&nbsp;
+                        <strong>Unique Attack Types:</strong> {fmt_num(len(stats["attack_types"]))}
+                        &nbsp;&nbsp;|&nbsp;&nbsp;
+                        <strong>Unique Attackers:</strong> {fmt_num(len(stats["top_attackers"]))}
+                      </td>
+                    </tr>
+                  </table>
+                </td>
+              </tr>
 
-            <!-- Top Attack Types -->
-            <div class="card">
-                <h2>Top Attack Types</h2>
-                {attack_types_chart}
-            </div>
+              <!-- Top Attack Types -->
+              <tr>
+                <td style="padding:0 20px 20px 20px;">
+                  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+                    <tr>
+                      <td style="font-family:Arial, sans-serif; font-size:18px; font-weight:bold; color:#333; padding:0 0 8px 0; border-bottom:2px solid #eee;">Top Attack Types</td>
+                    </tr>
+                    {attack_types_chart}
+                  </table>
+                </td>
+              </tr>
 
-            <!-- Top Attackers -->
-            <div class="card">
-                <h2>Top Attackers</h2>
-                <table>
-                    <thead><tr><th>IP Address</th><th>Requests</th><th>Percentage</th></tr></thead>
-                    <tbody>{top_attackers_rows}</tbody>
-                </table>
-            </div>
+              <!-- Top Attackers -->
+              <tr>
+                <td style="padding:0 20px 20px 20px;">
+                  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+                    <tr>
+                      <td style="font-family:Arial, sans-serif; font-size:18px; font-weight:bold; color:#333; padding:0 0 8px 0; border-bottom:2px solid #eee;">Top Attackers</td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;">
+                          <tr>
+                            <th align="left" style="padding:10px; font-family:Arial, sans-serif; font-size:13px; color:#333; background:#f4f4f4; border:1px solid #ddd;">IP Address</th>
+                            <th align="left" style="padding:10px; font-family:Arial, sans-serif; font-size:13px; color:#333; background:#f4f4f4; border:1px solid #ddd;">Requests</th>
+                            <th align="left" style="padding:10px; font-family:Arial, sans-serif; font-size:13px; color:#333; background:#f4f4f4; border:1px solid #ddd;">Percentage</th>
+                          </tr>
+                          {top_attackers_rows}
+                        </table>
+                      </td>
+                    </tr>
+                  </table>
+                </td>
+              </tr>
 
-            <!-- Recent Attacks -->
-            <div class="card">
-                <h2>Recent Attacks</h2>
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Date / Time</th><th>IP</th><th>Request</th><th>Message</th><th>Status</th>
-                        </tr>
-                    </thead>
-                    <tbody>{recent_attacks_rows}</tbody>
-                </table>
-            </div>
+              <!-- Recent Attacks -->
+              <tr>
+                <td style="padding:0 20px 20px 20px;">
+                  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+                    <tr>
+                      <td style="font-family:Arial, sans-serif; font-size:18px; font-weight:bold; color:#333; padding:0 0 8px 0; border-bottom:2px solid #eee;">Recent Attacks</td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;">
+                          <tr>
+                            <th align="left" style="padding:10px; font-family:Arial, sans-serif; font-size:13px; color:#333; background:#f4f4f4; border:1px solid #ddd;">Date / Time</th>
+                            <th align="left" style="padding:10px; font-family:Arial, sans-serif; font-size:13px; color:#333; background:#f4f4f4; border:1px solid #ddd;">IP</th>
+                            <th align="left" style="padding:10px; font-family:Arial, sans-serif; font-size:13px; color:#333; background:#f4f4f4; border:1px solid #ddd;">Request</th>
+                            <th align="left" style="padding:10px; font-family:Arial, sans-serif; font-size:13px; color:#333; background:#f4f4f4; border:1px solid #ddd;">Message</th>
+                            <th align="left" style="padding:10px; font-family:Arial, sans-serif; font-size:13px; color:#333; background:#f4f4f4; border:1px solid #ddd;">Status</th>
+                          </tr>
+                          {recent_attacks_rows}
+                        </table>
+                      </td>
+                    </tr>
+                  </table>
+                </td>
+              </tr>
 
-            <!-- Footer -->
-            <div class="card" style="text-align:right; font-size:11px; color:#666;">
-                <div>Generated on {datetime.now().strftime("%d/%b/%Y")}</div>
-                <div style="margin-top:4px;">Time: {datetime.now().strftime("%H:%M:%S")}</div>
-                <div style="margin-top:6px; font-weight:bold;">Zergaw Cloud</div>
-            </div>
-        </div>
+              <!-- Footer -->
+              <tr>
+                <td align="right" style="padding:16px 20px; font-family:Arial, sans-serif; font-size:11px; color:#666; border-top:1px solid #eee;">
+                  <div>Generated on {datetime.now().strftime("%d/%b/%Y")}</div>
+                  <div style="margin-top:4px;">Time: {datetime.now().strftime("%H:%M:%S")}</div>
+                  <div style="margin-top:6px; font-weight:bold;">Zergaw Cloud</div>
+                </td>
+              </tr>
+
+            </table>
+          </td>
+        </tr>
+      </table>
     </body>
     </html>
     """
@@ -670,7 +702,7 @@ def send_email(subject: str, html_content: str, to_email: str, logo_path: str = 
         try:
             with open(logo_path, "rb") as imgf:
                 mime_image = MIMEImage(imgf.read())
-                mime_image.add_header("Content-ID", "<logo>")
+                mime_image.add_header("Content-ID", "<logo>")  # matches src="cid:logo"
                 mime_image.add_header("Content-Disposition", "inline", filename=os.path.basename(logo_path))
                 related.attach(mime_image)
         except Exception as e:
@@ -707,8 +739,6 @@ def main():
         if RECIPIENTS:
             by_domain = parse_all_domains()
             reports = []
-
-            # Always send for every configured domain (events or no events)
             for dom, to_email in RECIPIENTS.items():
                 attacks = by_domain.get(dom.lower(), [])
                 reports.append({"domain": dom, "to_email": to_email, "attacks": attacks})
