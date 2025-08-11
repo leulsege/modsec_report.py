@@ -8,6 +8,7 @@ from email.mime.text import MIMEText
 from email.mime.image import MIMEImage
 from collections import defaultdict
 import datetime
+from datetime import datetime, timedelta
 import os
 import sys
 import json
@@ -27,6 +28,12 @@ LOG_POSITION_FILE = os.path.join(CACHE_DIR, "log_position.txt")
 DOMAIN = os.environ.get("DOMAIN", "zpanel.site")  # e.g., "abc.com"
 
 # Multi-domain recipients map (domain -> email). If empty, falls back to single-domain mode.
+# EXAMPLE:
+# RECIPIENTS = {
+#     "zpanel.site": "yafet.zerihun@zergaw.com",
+#     "blog.zpanel.site": "yafet.zerihun@zergaw.com",
+#     "node.zpanel.site": "yafet.zerihun@zergaw.com",
+# }
 RECIPIENTS = {
     # "zpanel.site": "security@zpanel.site",
     # "abc.com": "ops@abc.com",
@@ -56,7 +63,7 @@ START_DATE = END_DATE - datetime.timedelta(days=7)
 ENABLE_COUNTRY = os.environ.get("ENABLE_COUNTRY", "1") == "1"
 
 # Cache settings
-LOG_CACHE_TTL = 3600  # 1 hour cache for log parsing
+LOG_CACHE_TTL = 3600  # seconds
 # ==============================
 
 # Ensure cache directory exists
@@ -97,10 +104,16 @@ def get_file_position(filepath: str) -> int:
 def save_file_position(filepath: str, position: int) -> None:
     """Save last read position to cache."""
     try:
-        with open(LOG_POSITION_FILE, "w") as f:
-            json.dump({'file': filepath, 'position': position}, f)
+        _atomic_write_json(LOG_POSITION_FILE, {'file': filepath, 'position': position})
     except Exception:
         pass
+
+def _atomic_write_json(path: str, obj: dict) -> None:
+    """Write JSON atomically to avoid partial/corrupt files."""
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(obj, f)
+    os.replace(tmp_path, path)
 
 # ---------- GeoIP ----------
 GEOIP_READER = None
@@ -136,8 +149,7 @@ class IPCache:
         
     def save(self) -> None:
         try:
-            with open(self.cache_path, "w") as f:
-                json.dump(self.cache, f)
+            _atomic_write_json(self.cache_path, self.cache)
         except Exception:
             pass
 
@@ -158,13 +170,25 @@ def get_ip_country(ip: str) -> str:
     if not ENABLE_COUNTRY:
         return "Unknown"
 
-    if (
-        ip == "N/A"
-        or ip.startswith("10.")
-        or ip.startswith("192.168")
-        or ip.startswith("172.")
-        or ip.startswith("127.")
-    ):
+    if ip == "N/A":
+        return "Local Network"
+
+    def _is_private(ip_):
+        try:
+            a, b, *_ = [int(x) for x in ip_.split(".")]
+        except Exception:
+            return False
+        if a == 10:  # 10.0.0.0/8
+            return True
+        if a == 192 and b == 168:  # 192.168.0.0/16
+            return True
+        if a == 172 and 16 <= b <= 31:  # 172.16.0.0 – 172.31.0.0
+            return True
+        if a == 127:
+            return True
+        return False
+
+    if _is_private(ip):
         return "Local Network"
 
     # Check cache first
@@ -215,30 +239,30 @@ def _extract_attack_entries(block: str) -> List[Tuple[str, str, str]]:
     
     return [(attacker_ip, request_line, msg) for msg in messages]
 
-def _parse_time(block: str) -> Optional[datetime.datetime]:
+def _parse_time(block: str) -> Optional[datetime]:
     """Parse timestamp from log block."""
     ts_match = re.search(r"\[(\d{2}/\w+/\d{4}):(\d{2}:\d{2}:\d{2})", block)
     if not ts_match:
         return None
     date_str, time_str = ts_match.groups()
     try:
-        return datetime.datetime.strptime(f"{date_str}:{time_str}", "%d/%b/%Y:%H:%M:%S")
+        return datetime.strptime(f"{date_str}:{time_str}", "%d/%b/%Y:%H:%M:%S")
     except ValueError:
         return None
 
 def _parse_log_content(content: str) -> Dict[str, List[dict]]:
     """Parse log content into domain-organized attacks."""
-    by_domain = defaultdict(list)
+    by_domain: Dict[str, List[dict]] = defaultdict(list)
     
     for block in _iter_blocks(content):
         if "Host:" not in block:
             continue
 
-        # Extract domain
+        # Extract domain (strip :port)
         host_m = re.search(r"Host:\s*([^\s]+)", block)
         if not host_m:
             continue
-        dom = host_m.group(1).strip().lower()
+        dom = host_m.group(1).strip().lower().split(":")[0]
 
         # Filter by date
         dt = _parse_time(block)
@@ -260,24 +284,33 @@ def _parse_log_content(content: str) -> Dict[str, List[dict]]:
 
 def parse_all_domains() -> Dict[str, List[dict]]:
     """Parse entire log once with caching; return dict[domain] = [attacks]."""
-    current_hash = get_file_hash(LOG_FILE)
-    last_position = get_file_position(LOG_FILE)
-    
-    # Check cache first
+    current_hash = ""
+    try:
+        current_hash = get_file_hash(LOG_FILE)
+    except Exception:
+        # If hashing fails, we'll just skip the hash check
+        pass
+
+    # Try cache first (TTL + date window + (optional) hash match)
     try:
         if os.path.exists(LOG_CACHE_FILE):
             with open(LOG_CACHE_FILE, "r") as f:
                 cache_data = json.load(f)
-                if (cache_data.get('hash') == current_hash and 
-                    cache_data.get('start_date') == START_DATE.isoformat() and
-                    cache_data.get('end_date') == END_DATE.isoformat()):
-                    return cache_data['data']
+            ts = cache_data.get("timestamp")
+            start_ok = cache_data.get("start_date") == START_DATE.isoformat()
+            end_ok = cache_data.get("end_date") == END_DATE.isoformat()
+            hash_ok = (not current_hash) or (cache_data.get("hash") == current_hash)
+            if ts and start_ok and end_ok and hash_ok:
+                ts_dt = datetime.fromisoformat(ts)
+                if (datetime.now() - ts_dt).total_seconds() <= LOG_CACHE_TTL:
+                    return cache_data["data"]
     except Exception as e:
         print(f"[WARN] Cache load failed: {e}", file=sys.stderr)
 
     # Read log file (only new content if possible)
     try:
         file_size = os.path.getsize(LOG_FILE)
+        last_position = get_file_position(LOG_FILE)
         if last_position > 0 and last_position < file_size:
             # Read only new content
             with open(LOG_FILE, "r", errors="ignore") as f:
@@ -309,16 +342,21 @@ def parse_all_domains() -> Dict[str, List[dict]]:
             a["country"] = ip2country.get(a["ip"], "Unknown")
         lst.sort(key=lambda a: a["_datetime"], reverse=True)
 
-    # Save to cache
+    # Save to cache (JSON-safe: drop _datetime) — atomic write
     try:
-        with open(LOG_CACHE_FILE, "w") as f:
-            json.dump({
-                'hash': current_hash,
-                'start_date': START_DATE.isoformat(),
-                'end_date': END_DATE.isoformat(),
-                'data': by_domain,
-                'timestamp': datetime.datetime.now().isoformat()
-            }, f)
+        safe_by_domain: Dict[str, List[dict]] = {}
+        for dom, lst in by_domain.items():
+            safe_by_domain[dom] = [
+                {k: v for k, v in a.items() if k != "_datetime"} for a in lst
+            ]
+        payload = {
+            'hash': current_hash,
+            'start_date': START_DATE.isoformat(),
+            'end_date': END_DATE.isoformat(),
+            'data': safe_by_domain,
+            'timestamp': datetime.now().isoformat()
+        }
+        _atomic_write_json(LOG_CACHE_FILE, payload)
     except Exception as e:
         print(f"[WARN] Cache save failed: {e}", file=sys.stderr)
 
@@ -347,7 +385,7 @@ def generate_stats(attacks: List[dict]) -> dict:
 
         # Hourly distribution
         try:
-            dt = datetime.datetime.strptime(f"{attack['date']} {attack['time']}", "%d/%b/%Y %H:%M:%S")
+            dt = datetime.strptime(f"{attack['date']} {attack['time']}", "%d/%b/%Y %H:%M:%S")
             stats["hourly_distribution"][dt.hour] += 1
         except Exception:
             pass
@@ -432,8 +470,8 @@ def build_html_report(domain: str, attacks: List[dict], stats: dict) -> str:
 
                 <!-- Footer -->
                 <div class="card" style="text-align:right; font-size:11px; color:#666;">
-                    <div>Generated on {datetime.datetime.now().strftime("%d/%b/%Y")}</div>
-                    <div style="margin-top:4px;">Time: {datetime.datetime.now().strftime("%H:%M:%S")}</div>
+                    <div>Generated on {datetime.now().strftime("%d/%b/%Y")}</div>
+                    <div style="margin-top:4px;">Time: {datetime.now().strftime("%H:%M:%S")}</div>
                     <div style="margin-top:6px; font-weight:bold;">Zergaw Cloud</div>
                 </div>
             </div>
@@ -585,8 +623,8 @@ def build_html_report(domain: str, attacks: List[dict], stats: dict) -> str:
 
             <!-- Footer -->
             <div class="card" style="text-align:right; font-size:11px; color:#666;">
-                <div>Generated on {datetime.datetime.now().strftime("%d/%b/%Y")}</div>
-                <div style="margin-top:4px;">Time: {datetime.datetime.now().strftime("%H:%M:%S")}</div>
+                <div>Generated on {datetime.now().strftime("%d/%b/%Y")}</div>
+                <div style="margin-top:4px;">Time: {datetime.now().strftime("%H:%M:%S")}</div>
                 <div style="margin-top:6px; font-weight:bold;">Zergaw Cloud</div>
             </div>
         </div>
@@ -631,7 +669,7 @@ def send_many(reports: List[dict]) -> None:
         for r in reports:
             stats = generate_stats(r["attacks"])
             html = build_html_report(r["domain"], r["attacks"], stats)
-            subj = f"Weekly Security Update for your site: {r['domain']} - {datetime.datetime.now().strftime('%b %d, %Y')}"
+            subj = f"Weekly Security Update for your site: {r['domain']} - {datetime.now().strftime('%b %d, %Y')}"
             futures.append(ex.submit(send_email, subj, html, r["to_email"], LOGO_PATH))
         
         # Wait for all to complete and handle any exceptions
@@ -650,25 +688,20 @@ def main():
         if RECIPIENTS:
             by_domain = parse_all_domains()
             reports = []
-            
-            # Create reports for domains found in logs
-            for dom, attacks in by_domain.items():
-                to_email = RECIPIENTS.get(dom, DEFAULT_TO_EMAIL)
-                reports.append({"domain": dom, "to_email": to_email, "attacks": attacks})
-            
-            # Create "no events" reports for configured domains not found in logs
+
+            # Only create reports for the domains explicitly configured in RECIPIENTS
             for dom, to_email in RECIPIENTS.items():
-                if dom not in by_domain:
-                    reports.append({"domain": dom, "to_email": to_email, "attacks": []})
-            
+                attacks = by_domain.get(dom.lower(), [])
+                reports.append({"domain": dom, "to_email": to_email, "attacks": attacks})
+
             send_many(reports)
-            print(f"Sent {len(reports)} reports.")
+            print(f"Sent {len(reports)} reports (configured domains only).")
         else:
             # Single-domain fallback
             attacks = parse_single_domain(DOMAIN)
             stats = generate_stats(attacks)
             html_report = build_html_report(DOMAIN, attacks, stats)
-            subject = f"Weekly Security Update for your site: {DOMAIN} - {datetime.datetime.now().strftime('%b %d, %Y')}"
+            subject = f"Weekly Security Update for your site: {DOMAIN} - {datetime.now().strftime('%b %d, %Y')}"
             send_email(subject, html_report, DEFAULT_TO_EMAIL, LOGO_PATH)
             print(f"Report sent to {DEFAULT_TO_EMAIL} with {len(attacks)} attack entries for {DOMAIN}.")
     finally:
