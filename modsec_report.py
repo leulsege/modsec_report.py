@@ -7,7 +7,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.image import MIMEImage
 from collections import defaultdict
-import datetime
+import datetime as dt
 from datetime import datetime, timedelta
 import os
 import sys
@@ -56,8 +56,8 @@ GEOIP_DB = os.environ.get("GEOIP_DB")  # /path/to/GeoLite2-Country.mmdb
 IP_CACHE_PATH = os.path.join(CACHE_DIR, "ip_country_cache.json")
 
 # Date Range (default: last 7 days)
-END_DATE = datetime.date.today()
-START_DATE = END_DATE - datetime.timedelta(days=7)
+END_DATE = dt.date.today()
+START_DATE = END_DATE - dt.timedelta(days=7)
 
 # Toggle country enrichment quickly
 ENABLE_COUNTRY = os.environ.get("ENABLE_COUNTRY", "1") == "1"
@@ -265,19 +265,19 @@ def _parse_log_content(content: str) -> Dict[str, List[dict]]:
         dom = host_m.group(1).strip().lower().split(":")[0]
 
         # Filter by date
-        dt = _parse_time(block)
-        if not dt or not (START_DATE <= dt.date() <= END_DATE):
+        dt_obj = _parse_time(block)
+        if not dt_obj or not (START_DATE <= dt_obj.date() <= END_DATE):
             continue
 
         # Extract attack entries
         for ip, request_line, msg in _extract_attack_entries(block):
             by_domain[dom].append({
-                "date": dt.strftime("%d/%b/%Y"),
-                "time": dt.strftime("%H:%M:%S"),
+                "date": dt_obj.strftime("%d/%b/%Y"),
+                "time": dt_obj.strftime("%H:%M:%S"),
                 "ip": ip,
                 "request": request_line,
                 "message": msg,
-                "_datetime": dt,
+                "_datetime": dt_obj,
             })
 
     return by_domain
@@ -288,8 +288,7 @@ def parse_all_domains() -> Dict[str, List[dict]]:
     try:
         current_hash = get_file_hash(LOG_FILE)
     except Exception:
-        # If hashing fails, we'll just skip the hash check
-        pass
+        pass  # hashing failure isn't fatal
 
     # Try cache first (TTL + date window + (optional) hash match)
     try:
@@ -385,8 +384,8 @@ def generate_stats(attacks: List[dict]) -> dict:
 
         # Hourly distribution
         try:
-            dt = datetime.strptime(f"{attack['date']} {attack['time']}", "%d/%b/%Y %H:%M:%S")
-            stats["hourly_distribution"][dt.hour] += 1
+            dtp = datetime.strptime(f"{attack['date']} {attack['time']}", "%d/%b/%Y %H:%M:%S")
+            stats["hourly_distribution"][dtp.hour] += 1
         except Exception:
             pass
 
