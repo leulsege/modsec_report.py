@@ -165,15 +165,21 @@ def generate_stats(attacks):
     return stats
 
 def build_html_report(attacks, stats):
-    title_text = f"Weekly security update for your site: {DOMAIN}"
     subtitle = "Zergaw Cloud WAF Security Update"
 
     # logo referenced by CID in the email; fallback text if missing
     logo_html = f'<div style="font-size:20px;font-weight:bold;">{DOMAIN}</div>'
     if os.path.isfile(LOGO_PATH):
-        logo_html = '<img src="cid:logo" alt="Logo" style="height:70px; object-fit:contain;">'
+        # Reduced from 70px to 35px (≈50%)
+        logo_html = '<img src="cid:logo" alt="Logo" style="height:35px; object-fit:contain;">'
     else:
         print(f"[WARN] logo file not found at {LOGO_PATH}", file=sys.stderr)
+
+    # Split title styles: prefix vs domain
+    title_text_html = (
+        '<span style="font-size:18px; font-weight:normal;">Weekly security update for your site:</span> '
+        f'<span style="font-size:22px; font-weight:bold; color:#222;">{DOMAIN}</span>'
+    )
 
     if not attacks:
         return f"""
@@ -198,7 +204,7 @@ def build_html_report(attacks, stats):
                             {logo_html}
                         </div>
                         <div class="title-block">
-                            <div style="font-size:22px; font-weight:bold; margin-bottom:4px;">{title_text}</div>
+                            <div style="margin-bottom:4px;">{title_text_html}</div>
                             <div style="font-size:16px; color:#444; margin-bottom:6px;">{subtitle}</div>
                             <div class="small">Report from <strong>{START_DATE}</strong> to <strong>{END_DATE}</strong></div>
                         </div>
@@ -319,7 +325,7 @@ def build_html_report(attacks, stats):
                         {logo_html}
                     </div>
                     <div class="title-block">
-                        <div style="font-size:22px; font-weight:bold; margin-bottom:4px;">{title_text}</div>
+                        <div style="margin-bottom:4px;">{title_text_html}</div>
                         <div style="font-size:16px; color:#444; margin-bottom:6px;">{subtitle}</div>
                         <div class="small">Report from <strong>{START_DATE}</strong> to <strong>{END_DATE}</strong></div>
                     </div>
