@@ -22,17 +22,20 @@ from typing import Dict, List, Tuple, Optional
 LOG_FILE = "/usr/local/apache/logs/modsec_audit.log"
 CACHE_DIR = "/tmp/modsec_analyzer_cache"
 LOG_CACHE_FILE = os.path.join(CACHE_DIR, "log_cache.json")
+
+# Toggle incremental reads: 0 = full file scan for the date window (recommended)
+INCREMENTAL = int(os.environ.get("INCREMENTAL", "0"))
 LOG_POSITION_FILE = os.path.join(CACHE_DIR, "log_position.txt")
 
 # Single-domain mode (leave DOMAIN set to use this mode)
 DOMAIN = os.environ.get("DOMAIN", "zpanel.site")  # e.g., "abc.com"
 
 # Multi-domain recipients map (domain -> email). If empty, falls back to single-domain mode.
-# EXAMPLE:
+# Example:
 # RECIPIENTS = {
-#     "zpanel.site": "yafet.zerihun@zergaw.com",
-#     "blog.zpanel.site": "yafet.zerihun@zergaw.com",
-#     "node.zpanel.site": "yafet.zerihun@zergaw.com",
+#   "zpanel.site": "yafet.zerihun@zergaw.com",
+#   "blog.zpanel.site": "yafet.zerihun@zergaw.com",
+#   "node.zpanel.site": "yafet.zerihun@zergaw.com",
 # }
 RECIPIENTS = {
     # "zpanel.site": "security@zpanel.site",
@@ -46,6 +49,10 @@ SMTP_PASS = os.environ.get("SMTP_PASS", "YOUR_PASSWORD")
 DEFAULT_TO_EMAIL = os.environ.get("TO_EMAIL", "recipient@example.com")
 
 EMAIL_WORKERS = int(os.environ.get("EMAIL_WORKERS", "10"))
+
+# Limits (0 = unlimited)
+RECENT_LIMIT = int(os.environ.get("RECENT_LIMIT", "50"))
+TOP_ATTACKERS_LIMIT = int(os.environ.get("TOP_ATTACKERS_LIMIT", "20"))
 
 # Logo: expects logo.png in same folder as this script by default
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -101,19 +108,19 @@ def get_file_position(filepath: str) -> int:
         pass
     return 0
 
-def save_file_position(filepath: str, position: int) -> None:
-    """Save last read position to cache."""
-    try:
-        _atomic_write_json(LOG_POSITION_FILE, {'file': filepath, 'position': position})
-    except Exception:
-        pass
-
 def _atomic_write_json(path: str, obj: dict) -> None:
     """Write JSON atomically to avoid partial/corrupt files."""
     tmp_path = f"{path}.tmp"
     with open(tmp_path, "w") as f:
         json.dump(obj, f)
     os.replace(tmp_path, path)
+
+def save_file_position(filepath: str, position: int) -> None:
+    """Save last read position to cache."""
+    try:
+        _atomic_write_json(LOG_POSITION_FILE, {'file': filepath, 'position': position})
+    except Exception:
+        pass
 
 # ---------- GeoIP ----------
 GEOIP_READER = None
@@ -282,6 +289,29 @@ def _parse_log_content(content: str) -> Dict[str, List[dict]]:
 
     return by_domain
 
+def _read_log_content() -> str:
+    """Read the log content based on INCREMENTAL setting."""
+    if not INCREMENTAL:
+        # Always full read (ensures complete week coverage)
+        with open(LOG_FILE, "r", errors="ignore") as f:
+            return f.read()
+
+    # Incremental mode (optional)
+    file_size = os.path.getsize(LOG_FILE)
+    last_position = get_file_position(LOG_FILE)
+    with open(LOG_FILE, "r", errors="ignore") as f:
+        if 0 < last_position < file_size:
+            f.seek(last_position)
+            content = f.read()
+        else:
+            content = f.read()
+        # save new position
+        try:
+            save_file_position(LOG_FILE, file_size)
+        except Exception:
+            pass
+        return content
+
 def parse_all_domains() -> Dict[str, List[dict]]:
     """Parse entire log once with caching; return dict[domain] = [attacks]."""
     current_hash = ""
@@ -306,26 +336,12 @@ def parse_all_domains() -> Dict[str, List[dict]]:
     except Exception as e:
         print(f"[WARN] Cache load failed: {e}", file=sys.stderr)
 
-    # Read log file (only new content if possible)
+    # Read log file content
     try:
-        file_size = os.path.getsize(LOG_FILE)
-        last_position = get_file_position(LOG_FILE)
-        if last_position > 0 and last_position < file_size:
-            # Read only new content
-            with open(LOG_FILE, "r", errors="ignore") as f:
-                f.seek(last_position)
-                new_content = f.read()
-                by_domain = _parse_log_content(new_content)
-        else:
-            # Full read
-            with open(LOG_FILE, "r", errors="ignore") as f:
-                content = f.read()
-                by_domain = _parse_log_content(content)
-        
-        # Save current position
-        save_file_position(LOG_FILE, file_size)
+        content = _read_log_content()
+        by_domain = _parse_log_content(content)
     except Exception as e:
-        print(f"[ERROR] cannot read log file {LOG_FILE}: {e}", file=sys.stderr)
+        print(f"[ERROR] cannot read/parse log file {LOG_FILE}: {e}", file=sys.stderr)
         return {}
 
     # Country enrichment (bulk unique IPs)
@@ -405,15 +421,13 @@ def generate_stats(attacks: List[dict]) -> dict:
         else:
             stats["by_severity"]["Low"] += 1
 
-    # Get top 5 items
-    stats["top_5_attack_types"] = sorted(
-        stats["attack_types"].items(), key=lambda x: x[1], reverse=True
-    )[:5]
-    
-    stats["top_5_attackers"] = sorted(
-        stats["top_attackers"].items(), key=lambda x: x[1], reverse=True
-    )[:5]
-    
+    # Get top N items
+    top_types = sorted(stats["attack_types"].items(), key=lambda x: x[1], reverse=True)
+    top_attackers = sorted(stats["top_attackers"].items(), key=lambda x: x[1], reverse=True)
+
+    stats["top_5_attack_types"] = top_types[:5]  # keep email chart tight
+    stats["_all_attackers_sorted"] = top_attackers  # for table (we'll apply limit in HTML)
+
     return stats
 
 # ---------- HTML ----------
@@ -526,13 +540,20 @@ def build_html_report(domain: str, attacks: List[dict], stats: dict) -> str:
         </div>
         """
 
+    # Top attackers (apply limit here)
+    attackers_sorted = stats.get("_all_attackers_sorted", [])
+    if TOP_ATTACKERS_LIMIT > 0:
+        attackers_sorted = attackers_sorted[:TOP_ATTACKERS_LIMIT]
+
     top_attackers_rows = "".join(
         f"<tr><td>{ip}<br><small>{country}</small></td>"
         f"<td>{fmt_num(count)}</td>"
         f"<td>{pct(count, total)}</td></tr>"
-        for (ip, country), count in stats["top_5_attackers"]
+        for (ip, country), count in attackers_sorted
     )
 
+    # Recent attacks table (apply limit here)
+    recent_attacks = attacks if RECENT_LIMIT == 0 else attacks[:RECENT_LIMIT]
     recent_attacks_rows = "".join(
         f"""
         <tr>
@@ -546,7 +567,7 @@ def build_html_report(domain: str, attacks: List[dict], stats: dict) -> str:
             <td><span style="background-color:#e74c3c;color:white;padding:2px 8px;border-radius:12px;">BLOCKED</span></td>
         </tr>
         """
-        for atk in attacks[:10]
+        for atk in recent_attacks
     )
 
     return f"""
@@ -683,18 +704,17 @@ def main():
     _init_geoip()
 
     try:
-        # Multi-domain mode if RECIPIENTS provided; else single domain
         if RECIPIENTS:
             by_domain = parse_all_domains()
             reports = []
 
-            # Only create reports for the domains explicitly configured in RECIPIENTS
+            # Always send for every configured domain (events or no events)
             for dom, to_email in RECIPIENTS.items():
                 attacks = by_domain.get(dom.lower(), [])
                 reports.append({"domain": dom, "to_email": to_email, "attacks": attacks})
 
             send_many(reports)
-            print(f"Sent {len(reports)} reports (configured domains only).")
+            print(f"Sent {len(reports)} reports for configured domains: {', '.join(RECIPIENTS.keys())}")
         else:
             # Single-domain fallback
             attacks = parse_single_domain(DOMAIN)
