@@ -427,10 +427,9 @@ def generate_stats(attacks: List[dict]) -> dict:
 
     return stats
 
-# ---------- HTML ----------
+# ---------- HTML HEADER/LOGO ----------
 def _logo_block_html() -> str:
     """Return a robust logo block that renders consistently across Outlook/Gmail."""
-    # Use table layout + width attribute + inline styles
     return """
 <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
   <tr>
@@ -475,8 +474,9 @@ def _header_table_html(domain: str, subtitle: str, start_date: dt.date, end_date
 </table>
 """.strip()
 
+# ---------- HTML BUILDER ----------
 def build_html_report(domain: str, attacks: List[dict], stats: dict) -> str:
-    """Generate HTML email report with Outlook/Gmail-safe logo and spacing."""
+    """Generate HTML email report with Outlook/Gmail-safe logo, spacing, and severity summary cards."""
     subtitle = "Zergaw Cloud WAF Security Update"
     header_html = _header_table_html(domain, subtitle, START_DATE, END_DATE)
 
@@ -514,6 +514,7 @@ def build_html_report(domain: str, attacks: List[dict], stats: dict) -> str:
         </html>
         """
 
+    # Severity summary (email-safe "cards")
     severity_counts = {
         "Critical": stats["by_severity"].get("Critical", 0),
         "High": stats["by_severity"].get("High", 0),
@@ -522,6 +523,34 @@ def build_html_report(domain: str, attacks: List[dict], stats: dict) -> str:
     }
     total = stats["total_attacks"]
 
+    def sev_cell(title, count, bg, fg="#ffffff"):
+        return f"""
+        <td valign="top" width="25%" style="padding:6px;">
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:separate; border-radius:8px; background:{bg};">
+            <tr>
+              <td align="center" style="padding:12px;">
+                <div style="font-family:Arial, sans-serif; font-size:12px; color:{fg}; opacity:0.9;">{title.upper()}</div>
+                <div style="font-family:Arial, sans-serif; font-size:24px; font-weight:bold; color:{fg}; line-height:28px;">{fmt_num(count)}</div>
+                <div style="font-family:Arial, sans-serif; font-size:11px; color:{fg}; opacity:0.9;">{pct(count, total)}</div>
+              </td>
+            </tr>
+          </table>
+        </td>
+        """
+
+    # Solid backgrounds for Outlook reliability (close to your original gradients)
+    severity_cards_html = f"""
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+      <tr>
+        {sev_cell("Critical", severity_counts['Critical'], "#d93025")}
+        {sev_cell("High",     severity_counts['High'],     "#ff6b4a")}
+        {sev_cell("Medium",   severity_counts['Medium'],   "#f6b100")}
+        {sev_cell("Low",      severity_counts['Low'],      "#34a853")}
+      </tr>
+    </table>
+    """
+
+    # Top attack types chart rows
     def bar(msg, count):
         percentage = (count / total) * 100 if total else 0
         return f"""
@@ -540,33 +569,35 @@ def build_html_report(domain: str, attacks: List[dict], stats: dict) -> str:
 
     attack_types_chart = "".join(bar(msg, count) for msg, count in stats["top_5_attack_types"])
 
+    # Top attackers
     attackers_sorted = stats.get("_all_attackers_sorted", [])
     if TOP_ATTACKERS_LIMIT > 0:
         attackers_sorted = attackers_sorted[:TOP_ATTACKERS_LIMIT]
 
     top_attackers_rows = "".join(
         f"<tr>"
-        f"<td style='padding:10px; font-family:Arial, sans-serif; font-size:13px; color:#333;'>{ip}<br><span style='font-size:11px; color:#777;'>{country}</span></td>"
-        f"<td style='padding:10px; font-family:Arial, sans-serif; font-size:13px; color:#333;'>{fmt_num(count)}</td>"
-        f"<td style='padding:10px; font-family:Arial, sans-serif; font-size:13px; color:#333;'>{pct(count, total)}</td>"
+        f"<td style='padding:10px; font-family:Arial, sans-serif; font-size:13px; color:#333; border:1px solid #ddd;'>{ip}<br><span style='font-size:11px; color:#777;'>{country}</span></td>"
+        f"<td style='padding:10px; font-family:Arial, sans-serif; font-size:13px; color:#333; border:1px solid #ddd;'>{fmt_num(count)}</td>"
+        f"<td style='padding:10px; font-family:Arial, sans-serif; font-size:13px; color:#333; border:1px solid #ddd;'>{pct(count, total)}</td>"
         f"</tr>"
         for (ip, country), count in attackers_sorted
     )
 
+    # Recent attacks
     recent_attacks = attacks if RECENT_LIMIT == 0 else attacks[:RECENT_LIMIT]
     recent_attacks_rows = "".join(
         f"""
         <tr>
-          <td style="padding:10px; font-family:Arial, sans-serif; font-size:13px; color:#333;">
+          <td style="padding:10px; font-family:Arial, sans-serif; font-size:13px; color:#333; border:1px solid #ddd;">
             <div>{atk['date']}</div>
             <div style="font-size:11px; color:#777;">{atk['time']}</div>
           </td>
-          <td style="padding:10px; font-family:Arial, sans-serif; font-size:13px; color:#333;">
+          <td style="padding:10px; font-family:Arial, sans-serif; font-size:13px; color:#333; border:1px solid #ddd;">
             {atk['ip']}<br><span style="font-size:11px; color:#777;">{atk.get('country','Unknown')}</span>
           </td>
-          <td style="padding:10px; font-family:Arial, sans-serif; font-size:13px; color:#333; word-break:break-word;">{atk['request']}</td>
-          <td style="padding:10px; font-family:Arial, sans-serif; font-size:13px; color:#333; word-break:break-word;">{atk['message']}</td>
-          <td style="padding:10px; font-family:Arial, sans-serif; font-size:13px; color:#333;">
+          <td style="padding:10px; font-family:Arial, sans-serif; font-size:13px; color:#333; border:1px solid #ddd; word-break:break-word;">{atk['request']}</td>
+          <td style="padding:10px; font-family:Arial, sans-serif; font-size:13px; color:#333; border:1px solid #ddd; word-break:break-word;">{atk['message']}</td>
+          <td style="padding:10px; font-family:Arial, sans-serif; font-size:13px; color:#333; border:1px solid #ddd;">
             <span style="background-color:#e74c3c;color:#fff;padding:2px 8px;border-radius:12px; display:inline-block;">BLOCKED</span>
           </td>
         </tr>
@@ -574,6 +605,7 @@ def build_html_report(domain: str, attacks: List[dict], stats: dict) -> str:
         for atk in recent_attacks
     )
 
+    # Full HTML
     return f"""
     <html>
     <head>
@@ -601,6 +633,11 @@ def build_html_report(domain: str, attacks: List[dict], stats: dict) -> str:
                         <strong>Unique Attack Types:</strong> {fmt_num(len(stats["attack_types"]))}
                         &nbsp;&nbsp;|&nbsp;&nbsp;
                         <strong>Unique Attackers:</strong> {fmt_num(len(stats["top_attackers"]))}
+                      </td>
+                    </tr>
+                    <tr>
+                      <td style="padding-top:8px;">
+                        {severity_cards_html}
                       </td>
                     </tr>
                   </table>
