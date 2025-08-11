@@ -10,30 +10,102 @@ from collections import defaultdict
 import datetime
 import os
 import sys
+import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ==============================
 # Config (customize as needed)
 # ==============================
 LOG_FILE = "/usr/local/apache/logs/modsec_audit.log"
-DOMAIN = "zpanel.site"  # replace with actual domain, e.g., "abc.com"
-SMTP_SERVER = "cloud.zergaw.com"
-SMTP_PORT = 587
-SMTP_USER = "security.update@zergaw.com"
-SMTP_PASS = "YOUR_PASSWORD"
-TO_EMAIL = "recipient@example.com"
+
+# Single-domain mode (leave DOMAIN set to use this mode)
+DOMAIN = os.environ.get("DOMAIN", "zpanel.site")  # e.g., "abc.com"
+
+# Multi-domain recipients map (domain -> email). If empty, falls back to single-domain mode.
+RECIPIENTS = {
+    # "zpanel.site": "security@zpanel.site",
+    # "abc.com": "ops@abc.com",
+}
+
+SMTP_SERVER = os.environ.get("SMTP_SERVER", "cloud.zergaw.com")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER", "security.update@zergaw.com")
+SMTP_PASS = os.environ.get("SMTP_PASS", "YOUR_PASSWORD")
+DEFAULT_TO_EMAIL = os.environ.get("TO_EMAIL", "recipient@example.com")
+
+EMAIL_WORKERS = int(os.environ.get("EMAIL_WORKERS", "10"))
 
 # Logo: expects logo.png in same folder as this script by default
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOGO_PATH = os.environ.get("LOGO_PATH") or os.path.join(SCRIPT_DIR, "logo.png")
 
+# GeoIP2
+GEOIP_DB = os.environ.get("GEOIP_DB")  # /path/to/GeoLite2-Country.mmdb
+IP_CACHE_PATH = os.environ.get("IP_CACHE_PATH", "/tmp/ip_country_cache.json")
+
 # Date Range (default: last 7 days)
 END_DATE = datetime.date.today()
 START_DATE = END_DATE - datetime.timedelta(days=7)
+
+# Toggle country enrichment quickly
+ENABLE_COUNTRY = os.environ.get("ENABLE_COUNTRY", "1") == "1"
 # ==============================
 
-@lru_cache(maxsize=200)
+# ---------- Utilities ----------
+def fmt_num(n):
+    """Format integer with thousands separator."""
+    try:
+        return f"{int(n):,}"
+    except Exception:
+        return str(n)
+
+def pct(part, total):
+    if not total:
+        return "0.0%"
+    return f"{(part / total) * 100:.1f}%"
+
+# ---------- GeoIP ----------
+GEOIP_READER = None
+def _init_geoip():
+    global GEOIP_READER
+    if not ENABLE_COUNTRY:
+        return
+    if GEOIP_DB and os.path.isfile(GEOIP_DB):
+        try:
+            import geoip2.database
+            GEOIP_READER = geoip2.database.Reader(GEOIP_DB)
+        except Exception as e:
+            print(f"[WARN] GeoIP init failed: {e}", file=sys.stderr)
+
+# tiny persistent cache across runs
+try:
+    with open(IP_CACHE_PATH, "r") as _f:
+        IP_CACHE = json.load(_f)
+except Exception:
+    IP_CACHE = {}
+
+def _save_ip_cache():
+    try:
+        with open(IP_CACHE_PATH, "w") as _f:
+            json.dump(IP_CACHE, _f)
+    except Exception:
+        pass
+
+@lru_cache(maxsize=50000)
+def _country_from_geoip(ip):
+    if GEOIP_READER is None:
+        return None
+    try:
+        resp = GEOIP_READER.country(ip)
+        return resp.country.name or "Unknown"
+    except Exception:
+        return None
+
 def get_ip_country(ip):
-    """Return country name for given IP."""
+    """Return country name for given IP (local/private handled)."""
+    if not ENABLE_COUNTRY:
+        return "Unknown"
+
     if (
         ip == "N/A"
         or ip.startswith("10.")
@@ -42,86 +114,123 @@ def get_ip_country(ip):
         or ip.startswith("127.")
     ):
         return "Local Network"
+
+    # fast cache
+    if ip in IP_CACHE:
+        return IP_CACHE[ip]
+
+    # local db
+    country = _country_from_geoip(ip)
+    if country:
+        IP_CACHE[ip] = country
+        _save_ip_cache()
+        return country
+
+    # tiny-timeout fallback (HTTP)
     try:
-        resp = requests.get(
-            f"http://ip-api.com/json/{ip}?fields=status,country", timeout=3
-        )
+        resp = requests.get(f"http://ip-api.com/json/{ip}?fields=status,country", timeout=1.5)
         data = resp.json()
         if data.get("status") == "success":
-            return data.get("country", "Unknown")
+            country = data.get("country", "Unknown")
+            IP_CACHE[ip] = country
+            _save_ip_cache()
+            return country
     except Exception:
         pass
+
+    IP_CACHE[ip] = "Unknown"
+    _save_ip_cache()
     return "Unknown"
 
-def parse_modsec_log():
-    """Parse ModSecurity log for the given domain and date range."""
+# ---------- Parsing ----------
+def _iter_blocks(content):
+    # Split by audit part A boundaries
+    return re.split(r"\n--[a-f0-9]+-A--", content)
+
+def _extract_attack_entries(block):
+    """Yield attack dicts from a single ModSecurity block (already filtered by date)."""
+    # IP
+    attacker_ip = "N/A"
+    ip_match = re.search(r"^\[.*?\]\s+[a-zA-Z0-9]+\s+([\d\.]+)\s", block, re.MULTILINE) \
+               or re.search(r"X-Real-IP:\s*([\d\.]+)", block)
+    if ip_match:
+        attacker_ip = ip_match.group(1)
+
+    # Method + path
+    req_match = re.search(r"(GET|POST|HEAD|PUT|DELETE|OPTIONS) ([^\s]+) HTTP", block)
+    request_line = f"{req_match.group(1)} {req_match.group(2)}" if req_match else "N/A"
+
+    # Messages
+    messages = re.findall(r'\[msg "(.+?)"\]', block)
+    for msg in messages:
+        yield attacker_ip, request_line, msg
+
+def _parse_time(block):
+    ts_match = re.search(r"\[(\d{2}/\w+/\d{4}):(\d{2}:\d{2}:\d{2})", block)
+    if not ts_match:
+        return None
+    date_str, time_str = ts_match.groups()
+    try:
+        dt = datetime.datetime.strptime(f"{date_str}:{time_str}", "%d/%b/%Y:%H:%M:%S")
+        return dt
+    except ValueError:
+        return None
+
+def parse_all_domains():
+    """Parse entire log once; return dict[domain] = [attacks]."""
     try:
         with open(LOG_FILE, "r", errors="ignore") as f:
             content = f.read()
     except Exception as e:
         print(f"[ERROR] cannot read log file {LOG_FILE}: {e}", file=sys.stderr)
-        return []
+        return {}
 
-    blocks = re.split(r"\n--[a-f0-9]+-A--", content)
-    attacks = []
-
-    for block in blocks:
-        if f"Host: {DOMAIN}" not in block:
+    by_domain = defaultdict(list)
+    for block in _iter_blocks(content):
+        if "Host:" not in block:
             continue
 
-        ts_match = re.search(r"\[(\d{2}/\w+/\d{4}):(\d{2}:\d{2}:\d{2})", block)
-        if not ts_match:
+        # domain
+        host_m = re.search(r"Host:\s*([^\s]+)", block)
+        if not host_m:
+            continue
+        dom = host_m.group(1).strip().lower()
+
+        # timestamp filter
+        dt = _parse_time(block)
+        if not dt or not (START_DATE <= dt.date() <= END_DATE):
             continue
 
-        timestamp_str = ts_match.group(1)  # e.g., 01/Aug/2025
-        time_str = ts_match.group(2)       # e.g., 11:43:15
-
-        try:
-            attack_datetime = datetime.datetime.strptime(
-                f"{timestamp_str}:{time_str}", "%d/%b/%Y:%H:%M:%S"
-            )
-        except ValueError:
-            continue
-
-        if not (START_DATE <= attack_datetime.date() <= END_DATE):
-            continue
-
-        attacker_ip = "N/A"
-        ip_match = re.search(
-            r"^\[.*?\]\s+[a-zA-Z0-9]+\s+([\d\.]+)\s", block, re.MULTILINE
-        )
-        if not ip_match:
-            ip_match = re.search(r"X-Real-IP:\s*([\d\.]+)", block)
-        if ip_match:
-            attacker_ip = ip_match.group(1)
-
-        country = get_ip_country(attacker_ip)
-
-        req_match = re.search(r"(GET|POST|HEAD|PUT|DELETE|OPTIONS) ([^\s]+) HTTP", block)
-        request_line = (
-            f"{req_match.group(1)} {req_match.group(2)}"
-            if req_match
-            else "N/A"
-        )
-
-        messages = re.findall(r'\[msg "(.+?)"\]', block)
-        if not messages:
-            continue
-
-        for msg in messages:
-            attacks.append({
-                "date": attack_datetime.strftime("%d/%b/%Y"),
-                "time": attack_datetime.strftime("%H:%M:%S"),
-                "ip": attacker_ip,
-                "country": country,
+        for ip, request_line, msg in _extract_attack_entries(block):
+            by_domain[dom].append({
+                "date": dt.strftime("%d/%b/%Y"),
+                "time": dt.strftime("%H:%M:%S"),
+                "ip": ip,
                 "request": request_line,
                 "message": msg,
-                "_datetime": attack_datetime,
+                "_datetime": dt,
             })
 
-    attacks.sort(key=lambda a: a["_datetime"], reverse=True)
-    return attacks
+    # Country enrichment (bulk unique IPs)
+    if ENABLE_COUNTRY:
+        all_ips = {a["ip"] for lst in by_domain.values() for a in lst if a["ip"] != "N/A"}
+        ip2country = {ip: get_ip_country(ip) for ip in all_ips}
+    else:
+        ip2country = {}
 
+    for dom, lst in by_domain.items():
+        for a in lst:
+            a["country"] = ip2country.get(a["ip"], "Unknown")
+        lst.sort(key=lambda a: a["_datetime"], reverse=True)
+
+    return by_domain
+
+def parse_single_domain(target_domain):
+    """Compatibility: parse only one domain (legacy behavior)."""
+    by_domain = parse_all_domains()
+    return by_domain.get(target_domain.lower(), [])
+
+# ---------- Stats ----------
 def generate_stats(attacks):
     stats = {
         "total_attacks": len(attacks),
@@ -134,8 +243,9 @@ def generate_stats(attacks):
 
     for attack in attacks:
         stats["attack_types"][attack["message"]] += 1
-        stats["top_attackers"][(attack["ip"], attack["country"])] += 1
+        stats["top_attackers"][(attack["ip"], attack.get("country", "Unknown"))] += 1
 
+        # hour
         try:
             dt = datetime.datetime.strptime(f"{attack['date']} {attack['time']}", "%d/%b/%Y %H:%M:%S")
             stats["hourly_distribution"][dt.hour] += 1
@@ -147,11 +257,11 @@ def generate_stats(attacks):
             stats["methods"][method] += 1
 
         msg_lower = attack["message"].lower()
-        if "sql injection" in msg_lower or "rce" in msg_lower or "remote code execution" in msg_lower:
+        if any(k in msg_lower for k in ("sql injection", "rce", "remote code execution")):
             stats["by_severity"]["Critical"] += 1
-        elif "xss" in msg_lower or "cross-site scripting" in msg_lower:
+        elif any(k in msg_lower for k in ("xss", "cross-site scripting")):
             stats["by_severity"]["High"] += 1
-        elif "injection" in msg_lower or "traversal" in msg_lower or "file inclusion" in msg_lower:
+        elif any(k in msg_lower for k in ("injection", "traversal", "file inclusion")):
             stats["by_severity"]["Medium"] += 1
         else:
             stats["by_severity"]["Low"] += 1
@@ -164,13 +274,14 @@ def generate_stats(attacks):
     )[:5]
     return stats
 
-def build_html_report(attacks, stats):
+# ---------- HTML ----------
+def build_html_report(domain, attacks, stats):
     subtitle = "Zergaw Cloud WAF Security Update"
 
     # logo referenced by CID in the email; fallback text if missing
-    logo_html = f'<div style="font-size:20px;font-weight:bold;">{DOMAIN}</div>'
+    logo_html = f'<div style="font-size:20px;font-weight:bold;">{domain}</div>'
     if os.path.isfile(LOGO_PATH):
-        # Reduced from 70px to 35px (≈50%)
+        # Reduced from 70px to 35px (~50%)
         logo_html = '<img src="cid:logo" alt="Logo" style="height:35px; object-fit:contain;">'
     else:
         print(f"[WARN] logo file not found at {LOGO_PATH}", file=sys.stderr)
@@ -178,7 +289,7 @@ def build_html_report(attacks, stats):
     # Split title styles: prefix vs domain
     title_text_html = (
         '<span style="font-size:18px; font-weight:normal;">Weekly security update for your site:</span> '
-        f'<span style="font-size:22px; font-weight:bold; color:#222;">{DOMAIN}</span>'
+        f'<span style="font-size:22px; font-weight:bold; color:#222;">{domain}</span>'
     )
 
     if not attacks:
@@ -214,7 +325,7 @@ def build_html_report(attacks, stats):
                 <!-- No events -->
                 <div class="card">
                     <h2>{subtitle}</h2>
-                    <p>This is a weekly security update for <strong>{DOMAIN}</strong>. There were no recorded security events from <strong>{START_DATE}</strong> to <strong>{END_DATE}</strong>.</p>
+                    <p>This is a weekly security update for <strong>{domain}</strong>. There were no recorded security events from <strong>{START_DATE}</strong> to <strong>{END_DATE}</strong>.</p>
                 </div>
 
                 <!-- Footer -->
@@ -234,40 +345,41 @@ def build_html_report(attacks, stats):
         "Medium": stats["by_severity"].get("Medium", 0),
         "Low": stats["by_severity"].get("Low", 0),
     }
+    total = stats["total_attacks"]
 
     severity_cards = f"""
     <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; margin: 20px 0;">
         <div style="background: linear-gradient(135deg, #ff4d4d, #ff1a1a); padding: 15px; border-radius: 8px; color: white; text-align: center;">
             <div style="font-size: 12px; opacity: 0.9;">CRITICAL</div>
-            <div style="font-size: 24px; font-weight: bold;">{severity_counts['Critical']}</div>
-            <div style="font-size: 11px;">{(severity_counts['Critical'] / stats['total_attacks']) * 100 if stats['total_attacks'] else 0:.1f}%</div>
+            <div style="font-size: 24px; font-weight: bold;">{fmt_num(severity_counts['Critical'])}</div>
+            <div style="font-size: 11px;">{pct(severity_counts['Critical'], total)}</div>
         </div>
         <div style="background: linear-gradient(135deg, #ff9966, #ff5e62); padding: 15px; border-radius: 8px; color: white; text-align: center;">
             <div style="font-size: 12px; opacity: 0.9;">HIGH</div>
-            <div style="font-size: 24px; font-weight: bold;">{severity_counts['High']}</div>
-            <div style="font-size: 11px;">{(severity_counts['High'] / stats['total_attacks']) * 100 if stats['total_attacks'] else 0:.1f}%</div>
+            <div style="font-size: 24px; font-weight: bold;">{fmt_num(severity_counts['High'])}</div>
+            <div style="font-size: 11px;">{pct(severity_counts['High'], total)}</div>
         </div>
         <div style="background: linear-gradient(135deg, #ffcc00, #ffaa00); padding: 15px; border-radius: 8px; color: white; text-align: center;">
             <div style="font-size: 12px; opacity: 0.9;">MEDIUM</div>
-            <div style="font-size: 24px; font-weight: bold;">{severity_counts['Medium']}</div>
-            <div style="font-size: 11px;">{(severity_counts['Medium'] / stats['total_attacks']) * 100 if stats['total_attacks'] else 0:.1f}%</div>
+            <div style="font-size: 24px; font-weight: bold;">{fmt_num(severity_counts['Medium'])}</div>
+            <div style="font-size: 11px;">{pct(severity_counts['Medium'], total)}</div>
         </div>
         <div style="background: linear-gradient(135deg, #66cc66, #2eb82e); padding: 15px; border-radius: 8px; color: white; text-align: center;">
             <div style="font-size: 12px; opacity: 0.9;">LOW</div>
-            <div style="font-size: 24px; font-weight: bold;">{severity_counts['Low']}</div>
-            <div style="font-size: 11px;">{(severity_counts['Low'] / stats['total_attacks']) * 100 if stats['total_attacks'] else 0:.1f}%</div>
+            <div style="font-size: 24px; font-weight: bold;">{fmt_num(severity_counts['Low'])}</div>
+            <div style="font-size: 11px;">{pct(severity_counts['Low'], total)}</div>
         </div>
     </div>
     """
 
     attack_types_chart = ""
     for msg, count in stats["top_5_attack_types"]:
-        percentage = (count / stats["total_attacks"]) * 100 if stats["total_attacks"] else 0
+        percentage = (count / total) * 100 if total else 0
         attack_types_chart += f"""
         <div style="margin-bottom: 15px;">
             <div style="display: flex; justify-content: space-between; font-size: 13px;">
                 <span>{msg}</span>
-                <span>{count} ({percentage:.1f}%)</span>
+                <span>{fmt_num(count)} ({percentage:.1f}%)</span>
             </div>
             <div style="height: 8px; background-color: #ddd; border-radius: 4px; overflow: hidden;">
                 <div style="height: 100%; width: {percentage}%; background-color: #e74c3c;"></div>
@@ -277,8 +389,8 @@ def build_html_report(attacks, stats):
 
     top_attackers_rows = "".join(
         f"<tr><td>{ip}<br><small>{country}</small></td>"
-        f"<td>{count}</td>"
-        f"<td>{(count / stats['total_attacks']) * 100 if stats['total_attacks'] else 0:.1f}%</td></tr>"
+        f"<td>{fmt_num(count)}</td>"
+        f"<td>{pct(count, total)}</td></tr>"
         for (ip, country), count in stats["top_5_attackers"]
     )
 
@@ -289,7 +401,7 @@ def build_html_report(attacks, stats):
                 <div>{atk['date']}</div>
                 <div style="font-size:11px; color:#777;">{atk['time']}</div>
             </td>
-            <td>{atk['ip']}<br><small>{atk['country']}</small></td>
+            <td>{atk['ip']}<br><small>{atk.get('country','Unknown')}</small></td>
             <td style="word-break:break-word;">{atk['request']}</td>
             <td style="word-break:break-word;">{atk['message']}</td>
             <td><span style="background-color:#e74c3c;color:white;padding:2px 8px;border-radius:12px;">BLOCKED</span></td>
@@ -335,9 +447,9 @@ def build_html_report(attacks, stats):
             <!-- Overview -->
             <div class="card">
                 <h2>Security Overview</h2>
-                <p><strong>Total Attacks:</strong> {stats["total_attacks"]}</p>
-                <p><strong>Unique Attack Types:</strong> {len(stats["attack_types"])}</p>
-                <p><strong>Unique Attackers:</strong> {len(stats["top_attackers"])}</p>
+                <p><strong>Total Attacks:</strong> {fmt_num(stats["total_attacks"])}</p>
+                <p><strong>Unique Attack Types:</strong> {fmt_num(len(stats["attack_types"]))}</p>
+                <p><strong>Unique Attackers:</strong> {fmt_num(len(stats["top_attackers"]))}</p>
                 {severity_cards}
             </div>
 
@@ -381,29 +493,26 @@ def build_html_report(attacks, stats):
     """
     return html
 
-def send_email(subject, html_content):
-    # Create a related multipart to allow inline image
+# ---------- Email ----------
+def send_email(subject, html_content, to_email, logo_path=LOGO_PATH):
     related = MIMEMultipart("related")
     related["From"] = SMTP_USER
-    related["To"] = TO_EMAIL
+    related["To"] = to_email
     related["Subject"] = subject
 
-    # Alternative part (plain + html)
-    alternative = MIMEMultipart("alternative")
-    plain = MIMEText("Please view this email in HTML format.", "plain")
-    html = MIMEText(html_content, "html")
-    alternative.attach(plain)
-    alternative.attach(html)
-    related.attach(alternative)
+    alt = MIMEMultipart("alternative")
+    alt.attach(MIMEText("Please view this email in HTML format.", "plain"))
+    alt.attach(MIMEText(html_content, "html"))
+    related.attach(alt)
 
     # Attach logo inline if available
-    if os.path.isfile(LOGO_PATH):
+    if os.path.isfile(logo_path):
         try:
-            with open(LOGO_PATH, "rb") as imgf:
+            with open(logo_path, "rb") as imgf:
                 img_data = imgf.read()
             mime_image = MIMEImage(img_data)
             mime_image.add_header("Content-ID", "<logo>")
-            mime_image.add_header("Content-Disposition", "inline", filename=os.path.basename(LOGO_PATH))
+            mime_image.add_header("Content-Disposition", "inline", filename=os.path.basename(logo_path))
             related.attach(mime_image)
         except Exception as e:
             print(f"[WARN] failed to attach logo image: {e}", file=sys.stderr)
@@ -411,15 +520,45 @@ def send_email(subject, html_content):
     with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
         server.starttls()
         server.login(SMTP_USER, SMTP_PASS)
-        server.sendmail(SMTP_USER, TO_EMAIL, related.as_string())
+        server.sendmail(SMTP_USER, to_email, related.as_string())
+
+# ---------- Driver ----------
+def send_many(reports):
+    """reports: list of dicts {domain, to_email, attacks}"""
+    with ThreadPoolExecutor(max_workers=EMAIL_WORKERS) as ex:
+        futs = []
+        for r in reports:
+            stats = generate_stats(r["attacks"])
+            html = build_html_report(r["domain"], r["attacks"], stats)
+            subj = f"Weekly Security Update for your site: {r['domain']} - {datetime.datetime.now().strftime('%b %d, %Y')}"
+            futs.append(ex.submit(send_email, subj, html, r["to_email"], LOGO_PATH))
+        for f in as_completed(futs):
+            f.result()  # propagate errors
 
 def main():
-    attacks = parse_modsec_log()
-    stats = generate_stats(attacks)
-    html_report = build_html_report(attacks, stats)
-    subject = f"Weekly Security Update for your site: {DOMAIN} - {datetime.datetime.now().strftime('%b %d, %Y')}"
-    send_email(subject, html_report)
-    print(f"Report sent to {TO_EMAIL} with {len(attacks)} attack entries.")
+    _init_geoip()
+
+    # Multi-domain mode if RECIPIENTS provided; else single domain
+    if RECIPIENTS:
+        by_domain = parse_all_domains()
+        reports = []
+        for dom, attacks in by_domain.items():
+            to_email = RECIPIENTS.get(dom, DEFAULT_TO_EMAIL)
+            reports.append({"domain": dom, "to_email": to_email, "attacks": attacks})
+        if not reports:
+            # If no domains found, you might still want a "no events" mail per known recipient
+            for dom, to_email in RECIPIENTS.items():
+                reports.append({"domain": dom, "to_email": to_email, "attacks": []})
+        send_many(reports)
+        print(f"Sent {len(reports)} reports.")
+    else:
+        # single-domain fallback (compatible with your original flow)
+        attacks = parse_single_domain(DOMAIN)
+        stats = generate_stats(attacks)
+        html_report = build_html_report(DOMAIN, attacks, stats)
+        subject = f"Weekly Security Update for your site: {DOMAIN} - {datetime.datetime.now().strftime('%b %d, %Y')}"
+        send_email(subject, html_report, DEFAULT_TO_EMAIL, LOGO_PATH)
+        print(f"Report sent to {DEFAULT_TO_EMAIL} with {len(attacks)} attack entries for {DOMAIN}.")
 
 if __name__ == "__main__":
     main()
