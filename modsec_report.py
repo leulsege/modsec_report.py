@@ -31,12 +31,6 @@ LOG_POSITION_FILE = os.path.join(CACHE_DIR, "log_position.txt")
 DOMAIN = os.environ.get("DOMAIN", "zpanel.site")  # e.g., "abc.com"
 
 # Multi-domain recipients map (domain -> email). If empty, falls back to single-domain mode.
-# Example:
-# RECIPIENTS = {
-#   "zpanel.site": "yafet.zerihun@zergaw.com",
-#   "blog.zpanel.site": "yafet.zerihun@zergaw.com",
-#   "node.zpanel.site": "yafet.zerihun@zergaw.com",
-# }
 RECIPIENTS = {
     # "zpanel.site": "security@zpanel.site",
     # "abc.com": "ops@abc.com",
@@ -185,11 +179,11 @@ def get_ip_country(ip: str) -> str:
             a, b, *_ = [int(x) for x in ip_.split(".")]
         except Exception:
             return False
-        if a == 10:  # 10.0.0.0/8
+        if a == 10:
             return True
-        if a == 192 and b == 168:  # 192.168.0.0/16
+        if a == 192 and b == 168:
             return True
-        if a == 172 and 16 <= b <= 31:  # 172.16.0.0 – 172.31.0.0
+        if a == 172 and 16 <= b <= 31:
             return True
         if a == 127:
             return True
@@ -198,18 +192,15 @@ def get_ip_country(ip: str) -> str:
     if _is_private(ip):
         return "Local Network"
 
-    # Check cache first
     cached = IP_CACHE.get(ip)
     if cached is not None:
         return cached
 
-    # Try local GeoIP database
     country = _country_from_geoip(ip)
     if country:
         IP_CACHE.set(ip, country)
         return country
 
-    # Fallback to HTTP API with timeout
     try:
         resp = requests.get(f"http://ip-api.com/json/{ip}?fields=status,country", timeout=1.0)
         data = resp.json()
@@ -230,24 +221,19 @@ def _iter_blocks(content: str) -> List[str]:
 
 def _extract_attack_entries(block: str) -> List[Tuple[str, str, str]]:
     """Extract attack entries from a single ModSecurity block."""
-    # IP extraction
     ip_match = (
         re.search(r"^\[.*?\]\s+[a-zA-Z0-9]+\s+([\d\.]+)\s", block, re.MULTILINE) or
         re.search(r"X-Real-IP:\s*([\d\.]+)", block)
     )
     attacker_ip = ip_match.group(1) if ip_match else "N/A"
 
-    # Request line
     req_match = re.search(r"(GET|POST|HEAD|PUT|DELETE|OPTIONS) ([^\s]+) HTTP", block)
     request_line = f"{req_match.group(1)} {req_match.group(2)}" if req_match else "N/A"
 
-    # Messages
     messages = re.findall(r'\[msg "(.+?)"\]', block)
-    
     return [(attacker_ip, request_line, msg) for msg in messages]
 
 def _parse_time(block: str) -> Optional[datetime]:
-    """Parse timestamp from log block."""
     ts_match = re.search(r"\[(\d{2}/\w+/\d{4}):(\d{2}:\d{2}:\d{2})", block)
     if not ts_match:
         return None
@@ -258,25 +244,20 @@ def _parse_time(block: str) -> Optional[datetime]:
         return None
 
 def _parse_log_content(content: str) -> Dict[str, List[dict]]:
-    """Parse log content into domain-organized attacks."""
     by_domain: Dict[str, List[dict]] = defaultdict(list)
-    
     for block in _iter_blocks(content):
         if "Host:" not in block:
             continue
 
-        # Extract domain (strip :port)
         host_m = re.search(r"Host:\s*([^\s]+)", block)
         if not host_m:
             continue
         dom = host_m.group(1).strip().lower().split(":")[0]
 
-        # Filter by date
         dt_obj = _parse_time(block)
         if not dt_obj or not (START_DATE <= dt_obj.date() <= END_DATE):
             continue
 
-        # Extract attack entries
         for ip, request_line, msg in _extract_attack_entries(block):
             by_domain[dom].append({
                 "date": dt_obj.strftime("%d/%b/%Y"),
@@ -290,7 +271,6 @@ def _parse_log_content(content: str) -> Dict[str, List[dict]]:
     return by_domain
 
 def _read_log_content() -> str:
-    """Read the log content based on INCREMENTAL setting."""
     if not INCREMENTAL:
         with open(LOG_FILE, "r", errors="ignore") as f:
             return f.read()
@@ -310,14 +290,12 @@ def _read_log_content() -> str:
         return content
 
 def parse_all_domains() -> Dict[str, List[dict]]:
-    """Parse entire log once with caching; return dict[domain] = [attacks]."""
     current_hash = ""
     try:
         current_hash = get_file_hash(LOG_FILE)
     except Exception:
-        pass  # hashing failure isn't fatal
+        pass
 
-    # Try cache first (TTL + date window + (optional) hash match)
     try:
         if os.path.exists(LOG_CACHE_FILE):
             with open(LOG_CACHE_FILE, "r") as f:
@@ -333,7 +311,6 @@ def parse_all_domains() -> Dict[str, List[dict]]:
     except Exception as e:
         print(f"[WARN] Cache load failed: {e}", file=sys.stderr)
 
-    # Read log file content
     try:
         content = _read_log_content()
         by_domain = _parse_log_content(content)
@@ -341,20 +318,17 @@ def parse_all_domains() -> Dict[str, List[dict]]:
         print(f"[ERROR] cannot read/parse log file {LOG_FILE}: {e}", file=sys.stderr)
         return {}
 
-    # Country enrichment (bulk unique IPs)
     if ENABLE_COUNTRY:
         all_ips = {a["ip"] for lst in by_domain.values() for a in lst if a["ip"] != "N/A"}
         ip2country = {ip: get_ip_country(ip) for ip in all_ips}
     else:
         ip2country = {}
 
-    # Add country info and sort
     for dom, lst in by_domain.items():
         for a in lst:
             a["country"] = ip2country.get(a["ip"], "Unknown")
         lst.sort(key=lambda a: a["_datetime"], reverse=True)
 
-    # Save to cache (JSON-safe: drop _datetime) — atomic write
     try:
         safe_by_domain: Dict[str, List[dict]] = {}
         for dom, lst in by_domain.items():
@@ -375,13 +349,11 @@ def parse_all_domains() -> Dict[str, List[dict]]:
     return by_domain
 
 def parse_single_domain(target_domain: str) -> List[dict]:
-    """Parse only one domain (legacy behavior)."""
     by_domain = parse_all_domains()
     return by_domain.get(target_domain.lower(), [])
 
 # ---------- Stats ----------
 def generate_stats(attacks: List[dict]) -> dict:
-    """Generate statistics from attack data."""
     stats = {
         "total_attacks": len(attacks),
         "attack_types": defaultdict(int),
@@ -395,19 +367,16 @@ def generate_stats(attacks: List[dict]) -> dict:
         stats["attack_types"][attack["message"]] += 1
         stats["top_attackers"][(attack["ip"], attack.get("country", "Unknown"))] += 1
 
-        # Hourly distribution
         try:
             dtp = datetime.strptime(f"{attack['date']} {attack['time']}", "%d/%b/%Y %H:%M:%S")
             stats["hourly_distribution"][dtp.hour] += 1
         except Exception:
             pass
 
-        # HTTP methods
         if attack["request"] != "N/A":
             method = attack["request"].split()[0]
             stats["methods"][method] += 1
 
-        # Severity classification
         msg_lower = attack["message"].lower()
         if any(k in msg_lower for k in ("sql injection", "rce", "remote code execution")):
             stats["by_severity"]["Critical"] += 1
@@ -418,18 +387,16 @@ def generate_stats(attacks: List[dict]) -> dict:
         else:
             stats["by_severity"]["Low"] += 1
 
-    # Get top N items
     top_types = sorted(stats["attack_types"].items(), key=lambda x: x[1], reverse=True)
     top_attackers = sorted(stats["top_attackers"].items(), key=lambda x: x[1], reverse=True)
 
-    stats["top_5_attack_types"] = top_types[:5]  # keep email chart tight
-    stats["_all_attackers_sorted"] = top_attackers  # for table (we'll apply limit in HTML)
-
+    stats["top_5_attack_types"] = top_types[:5]
+    stats["_all_attackers_sorted"] = top_attackers
     return stats
 
-# ---------- HTML HEADER/LOGO ----------
+# ---------- EMAIL HTML HELPERS ----------
 def _logo_block_html() -> str:
-    """Return a robust logo block that renders consistently across Outlook/Gmail."""
+    """Logo with fixed width using table and inline styles (email-safe)."""
     return """
 <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
   <tr>
@@ -442,7 +409,7 @@ def _logo_block_html() -> str:
 """.strip()
 
 def _header_table_html(domain: str, subtitle: str, start_date: dt.date, end_date: dt.date) -> str:
-    """Header using tables (no flex), with fixed logo size and reliable spacing."""
+    """Table-based header with logo and titles."""
     logo_html = _logo_block_html()
     return f"""
 <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;">
@@ -474,9 +441,42 @@ def _header_table_html(domain: str, subtitle: str, start_date: dt.date, end_date
 </table>
 """.strip()
 
+def _severity_cards_html(counts: dict, total: int) -> str:
+    """Gradient severity cards using tables + inline styles (as per your original look)."""
+    def card(title, count, gradient_css):
+        return f"""
+<td valign="top" width="25%" style="padding:6px;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:separate; border-radius:8px;">
+    <tr>
+      <td align="center" style="padding:12px; border-radius:8px; color:#ffffff; {gradient_css}">
+        <div style="font-family:Arial, sans-serif; font-size:12px; opacity:0.9;">{title}</div>
+        <div style="font-family:Arial, sans-serif; font-size:24px; font-weight:bold; line-height:28px;">{fmt_num(count)}</div>
+        <div style="font-family:Arial, sans-serif; font-size:11px; opacity:0.9;">{pct(count, total)}</div>
+      </td>
+    </tr>
+  </table>
+</td>
+"""
+    # same gradients as you used before
+    gradients = {
+        "CRITICAL": "background: linear-gradient(135deg, #ff4d4d, #ff1a1a);",
+        "HIGH":     "background: linear-gradient(135deg, #ff9966, #ff5e62);",
+        "MEDIUM":   "background: linear-gradient(135deg, #ffcc00, #ffaa00);",
+        "LOW":      "background: linear-gradient(135deg, #66cc66, #2eb82e);",
+    }
+    return f"""
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="margin-top:8px;">
+  <tr>
+    {card("CRITICAL", counts.get("Critical", 0), gradients["CRITICAL"])}
+    {card("HIGH",     counts.get("High", 0),     gradients["HIGH"])}
+    {card("MEDIUM",   counts.get("Medium", 0),   gradients["MEDIUM"])}
+    {card("LOW",      counts.get("Low", 0),      gradients["LOW"])}
+  </tr>
+</table>
+""".strip()
+
 # ---------- HTML BUILDER ----------
 def build_html_report(domain: str, attacks: List[dict], stats: dict) -> str:
-    """Generate HTML email report with Outlook/Gmail-safe logo, spacing, and severity summary cards."""
     subtitle = "Zergaw Cloud WAF Security Update"
     header_html = _header_table_html(domain, subtitle, START_DATE, END_DATE)
 
@@ -514,44 +514,18 @@ def build_html_report(domain: str, attacks: List[dict], stats: dict) -> str:
         </html>
         """
 
-    # Severity summary (email-safe "cards")
+    # Severity cards
     severity_counts = {
         "Critical": stats["by_severity"].get("Critical", 0),
-        "High": stats["by_severity"].get("High", 0),
-        "Medium": stats["by_severity"].get("Medium", 0),
-        "Low": stats["by_severity"].get("Low", 0),
+        "High":     stats["by_severity"].get("High", 0),
+        "Medium":   stats["by_severity"].get("Medium", 0),
+        "Low":      stats["by_severity"].get("Low", 0),
     }
     total = stats["total_attacks"]
+    severity_cards_html = _severity_cards_html(severity_counts, total)
 
-    def sev_cell(title, count, bg, fg="#ffffff"):
-        return f"""
-        <td valign="top" width="25%" style="padding:6px;">
-          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:separate; border-radius:8px; background:{bg};">
-            <tr>
-              <td align="center" style="padding:12px;">
-                <div style="font-family:Arial, sans-serif; font-size:12px; color:{fg}; opacity:0.9;">{title.upper()}</div>
-                <div style="font-family:Arial, sans-serif; font-size:24px; font-weight:bold; color:{fg}; line-height:28px;">{fmt_num(count)}</div>
-                <div style="font-family:Arial, sans-serif; font-size:11px; color:{fg}; opacity:0.9;">{pct(count, total)}</div>
-              </td>
-            </tr>
-          </table>
-        </td>
-        """
-
-    # Solid backgrounds for Outlook reliability (close to your original gradients)
-    severity_cards_html = f"""
-    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
-      <tr>
-        {sev_cell("Critical", severity_counts['Critical'], "#d93025")}
-        {sev_cell("High",     severity_counts['High'],     "#ff6b4a")}
-        {sev_cell("Medium",   severity_counts['Medium'],   "#f6b100")}
-        {sev_cell("Low",      severity_counts['Low'],      "#34a853")}
-      </tr>
-    </table>
-    """
-
-    # Top attack types chart rows
-    def bar(msg, count):
+    # Top attack types chart rows (table-based)
+    def bar_row(msg, count):
         percentage = (count / total) * 100 if total else 0
         return f"""
         <tr>
@@ -567,7 +541,7 @@ def build_html_report(domain: str, attacks: List[dict], stats: dict) -> str:
         </tr>
         """
 
-    attack_types_chart = "".join(bar(msg, count) for msg, count in stats["top_5_attack_types"])
+    attack_types_chart = "".join(bar_row(msg, count) for msg, count in stats["top_5_attack_types"])
 
     # Top attackers
     attackers_sorted = stats.get("_all_attackers_sorted", [])
@@ -605,7 +579,7 @@ def build_html_report(domain: str, attacks: List[dict], stats: dict) -> str:
         for atk in recent_attacks
     )
 
-    # Full HTML
+    # Full HTML (table-based layout)
     return f"""
     <html>
     <head>
@@ -723,7 +697,6 @@ def build_html_report(domain: str, attacks: List[dict], stats: dict) -> str:
 
 # ---------- Email ----------
 def send_email(subject: str, html_content: str, to_email: str, logo_path: str = LOGO_PATH) -> None:
-    """Send email with HTML content and optional logo."""
     related = MIMEMultipart("related")
     related["From"] = SMTP_USER
     related["To"] = to_email
@@ -734,12 +707,11 @@ def send_email(subject: str, html_content: str, to_email: str, logo_path: str = 
     alt.attach(MIMEText(html_content, "html"))
     related.attach(alt)
 
-    # Attach logo inline if available
     if os.path.isfile(logo_path):
         try:
             with open(logo_path, "rb") as imgf:
                 mime_image = MIMEImage(imgf.read())
-                mime_image.add_header("Content-ID", "<logo>")  # matches src="cid:logo"
+                mime_image.add_header("Content-ID", "<logo>")
                 mime_image.add_header("Content-Disposition", "inline", filename=os.path.basename(logo_path))
                 related.attach(mime_image)
         except Exception as e:
@@ -752,7 +724,6 @@ def send_email(subject: str, html_content: str, to_email: str, logo_path: str = 
 
 # ---------- Driver ----------
 def send_many(reports: List[dict]) -> None:
-    """Send multiple reports concurrently."""
     with ThreadPoolExecutor(max_workers=EMAIL_WORKERS) as ex:
         futures = []
         for r in reports:
@@ -760,8 +731,6 @@ def send_many(reports: List[dict]) -> None:
             html = build_html_report(r["domain"], r["attacks"], stats)
             subj = f"Weekly Security Update for your site: {r['domain']} - {datetime.now().strftime('%b %d, %Y')}"
             futures.append(ex.submit(send_email, subj, html, r["to_email"], LOGO_PATH))
-        
-        # Wait for all to complete and handle any exceptions
         for future in as_completed(futures):
             try:
                 future.result()
@@ -769,9 +738,7 @@ def send_many(reports: List[dict]) -> None:
                 print(f"[ERROR] Failed to send email: {e}", file=sys.stderr)
 
 def main():
-    """Main entry point."""
     _init_geoip()
-
     try:
         if RECIPIENTS:
             by_domain = parse_all_domains()
@@ -779,11 +746,9 @@ def main():
             for dom, to_email in RECIPIENTS.items():
                 attacks = by_domain.get(dom.lower(), [])
                 reports.append({"domain": dom, "to_email": to_email, "attacks": attacks})
-
             send_many(reports)
             print(f"Sent {len(reports)} reports for configured domains: {', '.join(RECIPIENTS.keys())}")
         else:
-            # Single-domain fallback
             attacks = parse_single_domain(DOMAIN)
             stats = generate_stats(attacks)
             html_report = build_html_report(DOMAIN, attacks, stats)
@@ -791,7 +756,6 @@ def main():
             send_email(subject, html_report, DEFAULT_TO_EMAIL, LOGO_PATH)
             print(f"Report sent to {DEFAULT_TO_EMAIL} with {len(attacks)} attack entries for {DOMAIN}.")
     finally:
-        # Ensure IP cache is saved
         IP_CACHE.save()
 
 if __name__ == "__main__":
